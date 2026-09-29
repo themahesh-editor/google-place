@@ -11,6 +11,7 @@ import re
 import time
 import urllib.parse
 import urllib.robotparser
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -30,10 +31,14 @@ GOOGLE_PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
 
 TARGET_VERIFIED_LEADS = int(os.getenv("TARGET_VERIFIED_LEADS", "100"))
 MAX_PLACES_SEARCH_REQUESTS = int(os.getenv("MAX_PLACES_SEARCH_REQUESTS", "30"))
-MAX_RAW_CANDIDATES = int(os.getenv("MAX_RAW_CANDIDATES", "250"))
+MAX_RAW_CANDIDATES = int(os.getenv("MAX_RAW_CANDIDATES", "500"))
 SEARCH_PAGE_SIZE = min(20, max(1, int(os.getenv("SEARCH_PAGE_SIZE", "20"))))
 SEARCH_DELAY_SECONDS = float(os.getenv("SEARCH_DELAY_SECONDS", "2"))
-MAX_PAGES_PER_WEBSITE = int(os.getenv("MAX_PAGES_PER_WEBSITE", "5"))
+MAX_PAGES_PER_WEBSITE = int(os.getenv("MAX_PAGES_PER_WEBSITE", "10"))
+WEBSITE_REQUEST_DELAY_SECONDS = float(os.getenv("WEBSITE_REQUEST_DELAY_SECONDS", "0.25"))
+NO_EMAIL_RETRY_DAYS = int(os.getenv("NO_EMAIL_RETRY_DAYS", "7"))
+TRANSIENT_RETRY_DAYS = int(os.getenv("TRANSIENT_RETRY_DAYS", "1"))
+MAX_RETRY_CANDIDATES_PER_RUN = int(os.getenv("MAX_RETRY_CANDIDATES_PER_RUN", "50"))
 HTTP_TIMEOUT_SECONDS = int(os.getenv("HTTP_TIMEOUT_SECONDS", "15"))
 HONOR_ROBOTS = os.getenv("HONOR_ROBOTS", "true").lower() in {"1", "true", "yes"}
 
@@ -41,6 +46,7 @@ CRM_FILE = Path(os.getenv("CRM_FILE", "leads_crm.csv"))
 SEEN_DOMAINS_FILE = Path(os.getenv("SEEN_DOMAINS_FILE", "seen_domains.csv"))
 MEMORY_FILE = Path(os.getenv("MEMORY_FILE", "candidate_memory.jsonl"))
 RUN_LOG_FILE = Path(os.getenv("RUN_LOG_FILE", "run_log.jsonl"))
+RETRY_QUEUE_FILE = Path(os.getenv("RETRY_QUEUE_FILE", "retry_queue.csv"))
 
 USER_AGENT = os.getenv("OUTREACH_USER_AGENT", "AttachAILeadDiscovery/1.0 (+https://attachaiassistant.oneapp.dev/)")
 
@@ -58,6 +64,11 @@ TARGET_CITIES = [
     "Las Vegas NV", "Los Angeles CA", "San Diego CA", "Sacramento CA", "Chicago IL", "Columbus OH",
     "Indianapolis IN", "Cleveland OH", "Kansas City MO", "Raleigh NC", "Richmond VA", "Seattle WA",
     "Portland OR", "Salt Lake City UT", "Minneapolis MN", "Boston MA",
+]
+
+RETRY_QUEUE_HEADERS = [
+    "Domain", "PlaceId", "Company", "Website", "Address", "Types", "Query",
+    "LastReason", "Attempts", "NextRetryUTC",
 ]
 
 CRM_HEADERS = [
@@ -79,6 +90,8 @@ CONTACT_WORDS = ("contact", "about", "team", "staff", "leadership", "services", 
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.8"})
+ROBOTS_CACHE: dict[str, urllib.robotparser.RobotFileParser | None] = {}
+MX_CACHE: dict[str, bool] = {}
 
 
 @dataclass
@@ -170,6 +183,18 @@ def state_timezone(state: str) -> str:
 def ensure_csv(path: Path, headers: list[str]) -> None:
     if not path.exists():
         path.write_text(",".join(headers) + "\n", encoding="utf-8")
+        return
+    with path.open("r", encoding="utf-8", newline="") as f:
+        reader = csv.DictReader(f)
+        existing = reader.fieldnames or []
+        rows = list(reader)
+    if existing == headers:
+        return
+    with path.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=headers)
+        w.writeheader()
+        for row in rows:
+            w.writerow({h: row.get(h, "") for h in headers})
 
 
 def load_csv(path: Path) -> list[dict[str, str]]:
@@ -180,26 +205,103 @@ def load_csv(path: Path) -> list[dict[str, str]]:
 
 
 def append_csv(path: Path, headers: list[str], row: dict[str, Any]) -> None:
-    exists = path.exists()
+    ensure_csv(path, headers)
     with path.open("a", encoding="utf-8", newline="") as f:
         w = csv.DictWriter(f, fieldnames=headers)
-        if not exists:
-            w.writeheader()
         w.writerow({h: row.get(h, "") for h in headers})
 
 
 def seen_domains() -> set[str]:
-    ensure_csv(SEEN_DOMAINS_FILE, ["Domain", "FirstSeenUTC", "Source"])
-    return {normalize_domain(r.get("Domain", "")) for r in load_csv(SEEN_DOMAINS_FILE) if normalize_domain(r.get("Domain", ""))}
+    # Permanent suppression is only for domains that produced a verified lead.
+    # Older rows without a Status are treated as retryable/unknown so previously
+    # skipped leads can be retried after the extractor is improved. Verified CRM
+    # rows also count as permanent domain memory for backwards compatibility.
+    headers = ["Domain", "FirstSeenUTC", "Source", "Status"]
+    ensure_csv(SEEN_DOMAINS_FILE, headers)
+    verified = {
+        normalize_domain(r.get("Domain", ""))
+        for r in load_csv(SEEN_DOMAINS_FILE)
+        if normalize_domain(r.get("Domain", ""))
+        and (r.get("Status") or "").strip().upper() == "VERIFIED"
+    }
+    if CRM_FILE.exists():
+        for row in load_csv(CRM_FILE):
+            if (row.get("Verified") or "").upper() == "PASS" and (row.get("Status") or "").lower() == "verified":
+                domain = normalize_domain(row.get("Website", ""))
+                if domain:
+                    verified.add(domain)
+    return verified
 
 
 def remember_domain(domain: str) -> None:
     domain = normalize_domain(domain)
-    if not domain or domain in seen_domains():
+    if not domain:
         return
-    append_csv(SEEN_DOMAINS_FILE, ["Domain", "FirstSeenUTC", "Source"], {
-        "Domain": domain, "FirstSeenUTC": iso_now(), "Source": "public_website"
+    headers = ["Domain", "FirstSeenUTC", "Source", "Status"]
+    ensure_csv(SEEN_DOMAINS_FILE, headers)
+    for row in load_csv(SEEN_DOMAINS_FILE):
+        if normalize_domain(row.get("Domain", "")) == domain:
+            return
+    append_csv(SEEN_DOMAINS_FILE, headers, {
+        "Domain": domain, "FirstSeenUTC": iso_now(),
+        "Source": "verified_public_website", "Status": "VERIFIED",
     })
+
+
+def retry_due_rows() -> list[dict[str, str]]:
+    ensure_csv(RETRY_QUEUE_FILE, RETRY_QUEUE_HEADERS)
+    now = utc_now()
+    due = []
+    for row in load_csv(RETRY_QUEUE_FILE):
+        try:
+            when = dt.datetime.fromisoformat((row.get("NextRetryUTC") or "").replace("Z", "+00:00"))
+        except ValueError:
+            when = now
+        if when <= now:
+            due.append(row)
+    return due[:max(0, MAX_RETRY_CANDIDATES_PER_RUN)]
+
+
+def schedule_retry(candidate: Candidate, reason: str, days: int) -> None:
+    ensure_csv(RETRY_QUEUE_FILE, RETRY_QUEUE_HEADERS)
+    rows = load_csv(RETRY_QUEUE_FILE)
+    domain = normalize_domain(candidate.website)
+    existing = next((r for r in rows if normalize_domain(r.get("Domain", "")) == domain), None)
+    attempts = int(existing.get("Attempts", "0") or 0) + 1 if existing else 1
+    next_retry = utc_now() + dt.timedelta(days=max(1, days))
+    payload = {
+        "Domain": domain,
+        "PlaceId": candidate.place_id,
+        "Company": candidate.company,
+        "Website": candidate.website,
+        "Address": candidate.address,
+        "Types": json.dumps(candidate.types),
+        "Query": candidate.query,
+        "LastReason": reason,
+        "Attempts": str(attempts),
+        "NextRetryUTC": next_retry.replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+    }
+    if existing:
+        for row in rows:
+            if normalize_domain(row.get("Domain", "")) == domain:
+                row.update(payload)
+    else:
+        rows.append(payload)
+    with RETRY_QUEUE_FILE.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=RETRY_QUEUE_HEADERS)
+        w.writeheader()
+        w.writerows([{h: r.get(h, "") for h in RETRY_QUEUE_HEADERS} for r in rows])
+
+
+def remove_retry(domain: str) -> None:
+    domain = normalize_domain(domain)
+    if not RETRY_QUEUE_FILE.exists():
+        return
+    rows = [r for r in load_csv(RETRY_QUEUE_FILE) if normalize_domain(r.get("Domain", "")) != domain]
+    with RETRY_QUEUE_FILE.open("w", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=RETRY_QUEUE_HEADERS)
+        w.writeheader()
+        w.writerows([{h: r.get(h, "") for h in RETRY_QUEUE_HEADERS} for r in rows])
 
 
 def append_jsonl(path: Path, event: dict[str, Any]) -> None:
@@ -265,16 +367,17 @@ def llm_chat(system_prompt: str, user_prompt: str, max_tokens: int) -> str | Non
     for attempt in range(3):
         try:
             r = session.post(f"{NVIDIA_BASE_URL}/chat/completions", json=payload, headers=headers, timeout=NVIDIA_TIMEOUT_SECONDS)
-            if r.status_code in {429, 500, 502, 503, 504} and attempt < 2:
-                delay = 4 + attempt * 6
-                print(f"[NVIDIA] HTTP {r.status_code}; retrying in {delay}s")
-                time.sleep(delay)
-                continue
-
+            if r.status_code in {429, 500, 502, 503, 504}:
+                if attempt < 2:
+                    delay = 4 + attempt * 6
+                    print(f"[NVIDIA] HTTP {r.status_code}; retrying in {delay}s")
+                    time.sleep(delay)
+                    continue
+                print(f"[NVIDIA DEBUG] HTTP {r.status_code}: {r.text[:1200]}")
+                return None
             if r.status_code >= 400:
-                print(f"[Places DEBUG] HTTP {r.status_code}")
-                print(f"[Places DEBUG] Response: {r.text}")
-            r.raise_for_status()
+                print(f"[NVIDIA DEBUG] HTTP {r.status_code}: {r.text[:1200]}")
+                r.raise_for_status()
             data = r.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
             if isinstance(content, str) and content.strip():
@@ -287,28 +390,65 @@ def llm_chat(system_prompt: str, user_prompt: str, max_tokens: int) -> str | Non
     return None
 
 
-def choose_seed() -> str:
-    return SEED_KEYWORDS[dt.date.today().toordinal() % len(SEED_KEYWORDS)]
+def deterministic_queries(seed: str, count: int = 100) -> list[str]:
+    variants = ["", "local", "independent", "neighborhood", "specialist", "specialty", "professional", "boutique", "community"]
+    out = []
+    for city in TARGET_CITIES:
+        for variant in variants:
+            q = " ".join(x for x in [variant, seed, city] if x).strip()
+            if q and q not in out:
+                out.append(q)
+            if len(out) >= count:
+                return out
+    return out
+
+
+def query_has_city(query: str) -> bool:
+    low = query.lower()
+    return any(city.split()[0].lower() in low for city in TARGET_CITIES)
+
+
+BUSINESS_NOUNS = (
+    "dentist", "dentistry", "clinic", "practice", "contractor", "company", "firm",
+    "agency", "brokerage", "provider", "service", "studio", "group", "attorney",
+    "lawyer", "real estate", "property management", "accounting", "landscaping",
+    "inspection", "hvac", "roofing", "builder", "remodeling", "orthodontist",
+)
 
 
 def expand_queries(seed: str, count: int = 100) -> list[str]:
     system = """
-You generate lawful, non-deceptive business-discovery search queries.
+You generate lawful, non-deceptive business-discovery queries for Google Places.
 Return ONLY a JSON array of strings.
-Create diverse Google Places Text Search queries for the supplied business niche and city list.
-Vary service, specialization, neighborhood, and business-type wording.
-Prefer queries likely to find local or regional operating businesses.
-Do not search for people, personal contact details, or sensitive information.
-Do not invent businesses; output only search text.
+Every query must target an operating business, not a consumer question.
+Every query must include a business noun appropriate to the seed (such as contractor, company,
+firm, clinic, dentist, practice, agency, brokerage, or service provider) and a city or locality.
+Do not use consumer-intent modifiers such as reviews, price, cost, cheapest, specials, discount,
+celebrity, before-and-after, or how-to. Vary wording, specialization, neighborhoods, and cities.
+Prefer local or regional businesses.
 """.strip()
     prompt = f"Seed niche: {seed}\nCities: {', '.join(TARGET_CITIES)}\nGenerate {count} unique concise queries."
     raw = llm_chat(system, prompt, NVIDIA_MAX_TOKENS)
     out, seen = [], set()
     for q in parse_json_array(raw or ""):
-        key = re.sub(r"\s+", " ", q.lower()).strip()
-        if key and key not in seen:
-            seen.add(key)
-            out.append(q.strip())
+        q = re.sub(r"\s+", " ", q).strip()
+        low = q.lower()
+        if not q or any(bad in low for bad in (" review", " reviews", " price", " cost", " cheapest", "specials", "discount", "celebrity", "before and after")):
+            continue
+        if not query_has_city(q):
+            continue
+        if not any(noun in low for noun in BUSINESS_NOUNS):
+            continue
+        if low not in seen:
+            seen.add(low)
+            out.append(q)
+    if len(out) < min(count, 30):
+        for q in deterministic_queries(seed, count):
+            if q.lower() not in seen:
+                seen.add(q.lower())
+                out.append(q)
+                if len(out) >= count:
+                    break
     return out[:count]
 
 
@@ -318,11 +458,7 @@ def places_search(query: str) -> list[dict]:
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-        # This field mask uses one Text Search call to obtain the data needed for
-        # downstream public-website research. No Place Details call is required.
-        "X-Goog-FieldMask": (
-            "places.id,places.displayName,places.formattedAddress,places.websiteUri,places.types,places.businessStatus"
-        ),
+        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.websiteUri,places.types,places.businessStatus",
     }
     payload = {"textQuery": query, "pageSize": SEARCH_PAGE_SIZE, "languageCode": "en", "regionCode": "US"}
     for attempt in range(3):
@@ -333,7 +469,11 @@ def places_search(query: str) -> list[dict]:
                 print(f"[Places] 429 rate limit; retrying in {delay}s")
                 time.sleep(delay)
                 continue
-            r.raise_for_status()
+            if r.status_code >= 400:
+                print(f"[Places DEBUG] HTTP {r.status_code}: {r.text[:1500]}")
+                if r.status_code != 429 and 400 <= r.status_code < 500:
+                    return []
+                r.raise_for_status()
             return r.json().get("places", []) or []
         except Exception as exc:
             print(f"[Places] query failed ({query!r}): {exc}")
@@ -350,18 +490,23 @@ def extract_visible_text(html_doc: str, limit: int = 6000) -> str:
 
 
 def fetch_html(url: str) -> tuple[str, str] | None:
+    parsed = urllib.parse.urlparse(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
     if HONOR_ROBOTS:
         try:
-            p = urllib.parse.urlparse(url)
-            robots = f"{p.scheme}://{p.netloc}/robots.txt"
-            rr = session.get(robots, timeout=8)
-            if rr.status_code < 400:
-                rp = urllib.robotparser.RobotFileParser()
-                rp.set_url(robots)
-                rp.parse(rr.text.splitlines())
-                if not rp.can_fetch(USER_AGENT, url):
-                    print(f"[robots] blocked: {url}")
-                    return None
+            if origin not in ROBOTS_CACHE:
+                rr = session.get(f"{origin}/robots.txt", timeout=8)
+                if rr.status_code >= 400:
+                    ROBOTS_CACHE[origin] = None
+                else:
+                    rp = urllib.robotparser.RobotFileParser()
+                    rp.set_url(f"{origin}/robots.txt")
+                    rp.parse(rr.text.splitlines())
+                    ROBOTS_CACHE[origin] = rp
+            rp = ROBOTS_CACHE.get(origin)
+            if rp is not None and not rp.can_fetch(USER_AGENT, url):
+                print(f"[robots] blocked: {url}")
+                return None
         except Exception:
             pass
     try:
@@ -376,49 +521,185 @@ def fetch_html(url: str) -> tuple[str, str] | None:
         return None
 
 
+def fetch_sitemap(url: str) -> str | None:
+    try:
+        r = session.get(url, timeout=HTTP_TIMEOUT_SECONDS, allow_redirects=True)
+        if r.status_code >= 400:
+            return None
+        ctype = (r.headers.get("content-type") or "").lower()
+        if "xml" not in ctype and "text" not in ctype and not r.text.lstrip().startswith("<?xml"):
+            return None
+        return r.text
+    except Exception:
+        return None
+
+
+def sitemap_urls(home_url: str) -> list[str]:
+    p = urllib.parse.urlparse(home_url)
+    origin = f"{p.scheme}://{p.netloc}"
+    candidates = [f"{origin}/sitemap.xml", f"{origin}/sitemap_index.xml", f"{origin}/wp-sitemap.xml"]
+    maps = []
+    try:
+        rr = session.get(f"{origin}/robots.txt", timeout=8)
+        if rr.status_code < 400:
+            for line in rr.text.splitlines():
+                if line.lower().startswith("sitemap:"):
+                    candidates.append(line.split(":", 1)[1].strip())
+    except Exception:
+        pass
+    seen_maps = set()
+    urls = []
+    for sm in candidates:
+        if not sm or sm in seen_maps:
+            continue
+        seen_maps.add(sm)
+        body = fetch_sitemap(sm)
+        if not body:
+            continue
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError:
+            continue
+        locs = [loc.text.strip() for loc in root.iter() if loc.tag.lower().endswith("loc") and loc.text]
+        for u in locs:
+            if u.startswith(origin):
+                if "sitemap" in root.tag.lower() and u.endswith((".xml", ".xml.gz")):
+                    maps.append(u)
+                elif u not in urls:
+                    urls.append(u)
+            if len(urls) >= 80:
+                return urls
+    for sm in maps[:5]:
+        body = fetch_sitemap(sm)
+        if not body:
+            continue
+        try:
+            root = ET.fromstring(body)
+        except ET.ParseError:
+            continue
+        for loc in root.iter():
+            if loc.tag.lower().endswith("loc") and loc.text:
+                u = loc.text.strip()
+                if u.startswith(origin) and u not in urls:
+                    urls.append(u)
+                if len(urls) >= 80:
+                    return urls
+    return urls
+
+
 def website_pages(home_url: str) -> list[str]:
     p = urllib.parse.urlparse(home_url)
+    origin = f"{p.scheme}://{p.netloc}"
     host = normalize_domain(p.hostname or "")
+    priority_paths = [
+        "/contact", "/contact-us", "/contactus", "/get-in-touch", "/connect", "/connect-with-us",
+        "/about", "/about-us", "/company", "/team", "/our-team", "/staff", "/leadership",
+        "/locations", "/location", "/contact.html", "/contact-us.html", "/about.html", "/about-us.html",
+    ]
     pages = [home_url]
+    link_candidates = []
     first = fetch_html(home_url)
-    if not first:
-        return pages
-    final_url, html_doc = first
-    soup = BeautifulSoup(html_doc, "html.parser")
-    for a in soup.find_all("a", href=True):
-        href = urllib.parse.urljoin(final_url, a.get("href", ""))
-        x = urllib.parse.urlparse(href)
-        if x.scheme not in {"http", "https"} or normalize_domain(x.hostname or "") != host:
+    if first:
+        final_url, html_doc = first
+        soup = BeautifulSoup(html_doc, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = urllib.parse.urljoin(final_url, a.get("href", ""))
+            x = urllib.parse.urlparse(href)
+            if x.scheme not in {"http", "https"} or normalize_domain(x.hostname or "") != host:
+                continue
+            label = f"{a.get_text(' ', strip=True)} {x.path}".lower()
+            if any(w in label for w in CONTACT_WORDS + ("reach", "connect", "office", "staff", "leadership")):
+                clean = urllib.parse.urlunparse((x.scheme, x.netloc, x.path, "", "", ""))
+                if clean not in link_candidates:
+                    link_candidates.append(clean)
+    ranked = [origin + path for path in priority_paths]
+    ranked.extend(link_candidates)
+    for u in sitemap_urls(home_url):
+        label = u.lower()
+        if any(w in label for w in CONTACT_WORDS + ("reach", "connect", "office", "staff", "leadership")):
+            ranked.append(u)
+    seen = set(pages)
+    for u in ranked:
+        x = urllib.parse.urlparse(u)
+        clean = urllib.parse.urlunparse((x.scheme, x.netloc, x.path, "", "", ""))
+        if normalize_domain(x.hostname or "") != host or clean in seen:
             continue
-        label = f"{a.get_text(' ', strip=True)} {x.path}".lower()
-        if any(w in label for w in CONTACT_WORDS):
-            clean = urllib.parse.urlunparse((x.scheme, x.netloc, x.path, "", "", ""))
-            if clean not in pages:
-                pages.append(clean)
+        pages.append(clean)
+        seen.add(clean)
         if len(pages) >= MAX_PAGES_PER_WEBSITE:
             break
     return pages[:MAX_PAGES_PER_WEBSITE]
 
 
+def decode_cloudflare_email(encoded: str) -> str:
+    try:
+        key = int(encoded[:2], 16)
+        return "".join(chr(int(encoded[i:i+2], 16) ^ key) for i in range(2, len(encoded), 2))
+    except Exception:
+        return ""
+
+
+def html_unescape(text: str) -> str:
+    return BeautifulSoup(text or "", "html.parser").get_text(" ")
+
+
+def email_strings(text: str) -> list[str]:
+    if not text:
+        return []
+    text = html_unescape(text)
+    found = {e.lower() for e in EMAIL_RE.findall(text)}
+    obfuscated = re.sub(r"(?<![A-Za-z0-9])(?:\[\s*at\s*\]|\(\s*at\s*\)|\{\s*at\s*\}|<\s*at\s*>|at|@)(?![A-Za-z0-9])", "@", text, flags=re.I)
+    obfuscated = re.sub(r"(?<![A-Za-z0-9])(?:\[\s*dot\s*\]|\(\s*dot\s*\)|\{\s*dot\s*\}|<\s*dot\s*>|dot)(?![A-Za-z0-9])", ".", obfuscated, flags=re.I)
+    obfuscated = re.sub(r"\s*@\s*", "@", obfuscated)
+    obfuscated = re.sub(r"\s*\.\s*", ".", obfuscated)
+    found.update(e.lower() for e in EMAIL_RE.findall(obfuscated))
+    return sorted(found)
+
+
+def jsonld_emails(soup: BeautifulSoup) -> list[str]:
+    out = []
+    def walk(value: Any) -> None:
+        if isinstance(value, dict):
+            for k, v in value.items():
+                if k.lower() in {"email", "emailaddress"} and isinstance(v, str):
+                    out.extend(email_strings(v))
+                else:
+                    walk(v)
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+    for script in soup.find_all("script", attrs={"type": re.compile(r"application/ld\+json", re.I)}):
+        try:
+            walk(json.loads(script.get_text(" ", strip=True)))
+        except Exception:
+            continue
+    return out
+
+
 def extract_emails(url: str, html_doc: str) -> list[EmailFinding]:
     soup = BeautifulSoup(html_doc, "html.parser")
-    visible = extract_visible_text(html_doc)
-    result, seen = [], set()
-    for a in soup.find_all("a", href=True):
-        href = a.get("href", "")
+    candidates = []
+    for anchor in soup.find_all("a", href=True):
+        href = html_unescape(urllib.parse.unquote(anchor.get("href", "")))
         if href.lower().startswith("mailto:"):
-            raw = urllib.parse.unquote(href[7:]).split("?", 1)[0]
-            for e in EMAIL_RE.findall(raw):
-                e = e.lower()
-                if e not in seen:
-                    seen.add(e)
-                    result.append(EmailFinding(e, url, "mailto link"))
-    for e in EMAIL_RE.findall(visible):
-        e = e.lower()
-        if e not in seen:
+            candidates.extend(email_strings(href[7:].split("?", 1)[0]))
+        for value in (anchor.get("aria-label"), anchor.get("title"), anchor.get("data-email")):
+            candidates.extend(email_strings(value or ""))
+    for node in soup.find_all(attrs={"data-cfemail": True}):
+        candidates.extend(email_strings(decode_cloudflare_email(node.get("data-cfemail", ""))))
+    for href in re.findall(r"/cdn-cgi/l/email-protection#([0-9a-fA-F]+)", html_doc):
+        candidates.extend(email_strings(decode_cloudflare_email(href)))
+    candidates.extend(email_strings(extract_visible_text(html_doc, 12000)))
+    candidates.extend(email_strings(html_doc))
+    candidates.extend(jsonld_emails(soup))
+    result, seen = [], set()
+    for e in candidates:
+        e = e.strip().lower()
+        if e and e not in seen:
             seen.add(e)
-            pos = visible.lower().find(e)
-            result.append(EmailFinding(e, url, visible[max(0, pos - 120):pos + 220]))
+            pos = html_doc.lower().find(e)
+            snippet = html_unescape(html_doc[max(0, pos - 180):pos + 300]) if pos >= 0 else "public website email"
+            result.append(EmailFinding(e, url, re.sub(r"\s+", " ", snippet).strip()[:500]))
     return result
 
 
@@ -430,10 +711,15 @@ def valid_syntax(email_addr: str) -> bool:
 
 
 def has_mx(domain: str) -> bool:
+    domain = normalize_domain(domain)
+    if domain in MX_CACHE:
+        return MX_CACHE[domain]
     try:
-        return any(getattr(x, "exchange", None) for x in dns.resolver.resolve(domain, "MX", lifetime=7))
+        result = any(getattr(x, "exchange", None) for x in dns.resolver.resolve(domain, "MX", lifetime=7))
     except Exception:
-        return False
+        result = False
+    MX_CACHE[domain] = result
+    return result
 
 
 def choose_public_business_email(findings: list[EmailFinding], website: str) -> EmailFinding | None:
@@ -472,7 +758,7 @@ def website_research(url: str) -> tuple[list[EmailFinding], str] | None:
             seen.add(finding.email)
             unique.append(finding)
     facts = "\n".join(texts)[:12000]
-    return (unique, facts) if facts else None
+    return (unique, facts) if facts or unique else None
 
 
 def llm_qualify(candidate: Candidate, facts: str, public_email: EmailFinding) -> dict | None:
@@ -490,10 +776,14 @@ When uncertain, REJECT.
         f"Types: {', '.join(candidate.types)}\nWebsite: {candidate.website}\nPublic email: {public_email.email}\n"
         f"Website evidence:\n{facts[:10000]}"
     )
-    obj = parse_json_object(llm_chat(system, prompt, 900) or "")
+    raw = llm_chat(system, prompt, 900)
+    if not raw:
+        print(f"[LLM] temporary qualification failure for {candidate.company}; queued for retry")
+        return {"_decision": "RETRY"}
+    obj = parse_json_object(raw)
     if not obj:
-        print(f"[LLM] invalid qualification JSON for {candidate.company}")
-        return None
+        print(f"[LLM] invalid qualification JSON for {candidate.company}; queued for retry")
+        return {"_decision": "RETRY"}
     action = str(obj.get("action", "")).upper()
     scale = str(obj.get("scale_class", "UNKNOWN")).upper()
     try:
@@ -501,8 +791,9 @@ When uncertain, REJECT.
     except (TypeError, ValueError):
         confidence = 0.0
     if action != "KEEP" or scale not in {"LOCAL", "REGIONAL"} or confidence < 0.75:
-        return None
+        return {"_decision": "REJECT"}
     return {
+        "_decision": "KEEP",
         "company_name": str(obj.get("company_name") or candidate.company).strip()[:180],
         "scale_class": scale,
         "confidence": round(confidence, 3),
@@ -538,34 +829,123 @@ def candidate_from_place(place: dict, query: str) -> Candidate | None:
     return Candidate(place_id, company, website, address, types, query)
 
 
+def candidate_from_retry(row: dict[str, str]) -> Candidate:
+    try:
+        types = json.loads(row.get("Types") or "[]")
+        if not isinstance(types, list):
+            types = []
+    except Exception:
+        types = []
+    return Candidate(row.get("PlaceId", ""), row.get("Company", ""), row.get("Website", ""),
+                     row.get("Address", ""), [str(x) for x in types], row.get("Query", ""))
+
+
+def process_candidate(candidate: Candidate, *, known_domains: set[str], seen_place_ids: set[str],
+                       seen_companies: set[str], attempted_domains: set[str]) -> tuple[str, dict | None]:
+    domain = normalize_domain(candidate.website)
+    if not domain or domain in known_domains or domain in attempted_domains:
+        return "duplicate", None
+    if candidate.place_id in seen_place_ids or normalize_company(candidate.company) in seen_companies:
+        return "duplicate", None
+    attempted_domains.add(domain)
+    print(f"  [Research] {candidate.company} -> {candidate.website}")
+    research = website_research(candidate.website)
+    if not research:
+        print("    [Retry] website fetch unavailable")
+        schedule_retry(candidate, "website_unavailable", TRANSIENT_RETRY_DAYS)
+        return "retry", None
+    findings, facts = research
+    public_email = choose_public_business_email(findings, candidate.website)
+    if not public_email:
+        print("    [Retry] no verified public business email after deep website scan")
+        schedule_retry(candidate, "no_public_email", NO_EMAIL_RETRY_DAYS)
+        return "retry", None
+    qualified = llm_qualify(candidate, facts, public_email)
+    if qualified.get("_decision") == "RETRY":
+        schedule_retry(candidate, "llm_temporary_failure", TRANSIENT_RETRY_DAYS)
+        return "retry", None
+    if qualified.get("_decision") != "KEEP":
+        return "rejected", None
+    state = state_from_address(candidate.address)
+    city = city_from_address(candidate.address, state)
+    row = {
+        "Email": public_email.email, "Company": qualified["company_name"], "Website": candidate.website,
+        "City": city, "State": state, "Timezone": state_timezone(state),
+        "LeadSource": "Google Places Text Search -> public website", "Verified": "PASS",
+        "PlaceId": candidate.place_id, "EmailSourceURL": public_email.source_url,
+        "WebsiteFacts": facts[:6000], "ScaleClass": qualified["scale_class"],
+        "QualificationConfidence": str(qualified["confidence"]), "Status": "Verified",
+        "FirstSeenDate": iso_now(), "Notes": qualified["reason"],
+    }
+    if already_in_crm(public_email.email, domain, qualified["company_name"]):
+        return "duplicate", None
+    append_csv(CRM_FILE, CRM_HEADERS, row)
+    remember_domain(domain)
+    remove_retry(domain)
+    known_domains.add(domain)
+    seen_place_ids.add(candidate.place_id)
+    seen_companies.add(normalize_company(qualified["company_name"]))
+    append_jsonl(MEMORY_FILE, {
+        "event": "verified_lead", "place_id": candidate.place_id,
+        "domain_sha256": hashlib.sha256(domain.encode()).hexdigest(),
+        "email": public_email.email, "qualification": qualified,
+    })
+    print(f"    [VERIFIED] {public_email.email}")
+    return "verified", row
+
+
 def main() -> None:
     ensure_csv(CRM_FILE, CRM_HEADERS)
-    ensure_csv(SEEN_DOMAINS_FILE, ["Domain", "FirstSeenUTC", "Source"])
+    ensure_csv(SEEN_DOMAINS_FILE, ["Domain", "FirstSeenUTC", "Source", "Status"])
+    ensure_csv(RETRY_QUEUE_FILE, RETRY_QUEUE_HEADERS)
     if not NVIDIA_API_KEY or not GOOGLE_PLACES_API_KEY:
         raise SystemExit("Missing NVIDIA_API_KEY or GOOGLE_PLACES_API_KEY")
 
     start = time.time()
     seed = choose_seed()
     print("=" * 78)
-    print("Google Place Lead Discovery Experiment")
+    print("Google Place Lead Discovery Experiment - deep website recovery")
     print(f"Seed: {seed}")
     print(f"Target verified leads: {TARGET_VERIFIED_LEADS}")
     print(f"Max Places search requests: {MAX_PLACES_SEARCH_REQUESTS}")
     print(f"Max raw candidates: {MAX_RAW_CANDIDATES}")
+    print(f"Max pages per website: {MAX_PAGES_PER_WEBSITE}")
     print("=" * 78)
-
-    queries = expand_queries(seed, 100)
-    if not queries:
-        raise SystemExit("LLM did not return usable search queries")
-    print(f"[LLM] generated {len(queries)} search queries")
 
     known_domains = seen_domains()
     crm_rows = existing_leads()
     seen_place_ids = {r.get("PlaceId", "").strip() for r in crm_rows if r.get("PlaceId")}
     seen_companies = {normalize_company(r.get("Company", "")) for r in crm_rows if r.get("Company")}
+    attempted_domains: set[str] = set()
+    raw_seen: set[str] = set()
+    verified_count = search_calls = rejected = 0
+    email_missing = website_failed = llm_retry = duplicate_count = 0
 
-    raw_seen = set()
-    verified_count = search_calls = processed = rejected = 0
+    for retry_row in retry_due_rows():
+        if verified_count >= TARGET_VERIFIED_LEADS:
+            break
+        status, _ = process_candidate(candidate_from_retry(retry_row), known_domains=known_domains,
+                                       seen_place_ids=seen_place_ids, seen_companies=seen_companies,
+                                       attempted_domains=attempted_domains)
+        if status == "verified":
+            verified_count += 1
+        elif status == "retry":
+            reason = retry_row.get("LastReason", "")
+            if reason == "no_public_email":
+                email_missing += 1
+            elif reason == "llm_temporary_failure":
+                llm_retry += 1
+            else:
+                website_failed += 1
+        elif status == "rejected":
+            rejected += 1
+        else:
+            duplicate_count += 1
+
+    queries = expand_queries(seed, 100)
+    if not queries:
+        raise SystemExit("No usable discovery queries")
+    print(f"[LLM] generated {len(queries)} usable business-first search queries")
     query_order = list(queries)
     random.Random(dt.date.today().toordinal()).shuffle(query_order)
 
@@ -575,92 +955,47 @@ def main() -> None:
         print(f"[Places] search {search_calls + 1}/{MAX_PLACES_SEARCH_REQUESTS}: {query}")
         places = places_search(query)
         search_calls += 1
-
         for place in places:
             if verified_count >= TARGET_VERIFIED_LEADS or len(raw_seen) >= MAX_RAW_CANDIDATES:
                 break
             candidate = candidate_from_place(place, query)
             if not candidate:
                 continue
-            raw_key = candidate.place_id
-            if raw_key in raw_seen:
+            if candidate.place_id in raw_seen:
                 continue
-            raw_seen.add(raw_key)
-
+            raw_seen.add(candidate.place_id)
             domain = normalize_domain(candidate.website)
             append_jsonl(MEMORY_FILE, {
-                "event": "candidate_seen",
-                "place_id": candidate.place_id,
-                "query": query,
+                "event": "candidate_seen", "place_id": candidate.place_id, "query": query,
                 "domain_sha256": hashlib.sha256(domain.encode()).hexdigest() if domain else "",
             })
-
-            if domain in known_domains or candidate.place_id in seen_place_ids or normalize_company(candidate.company) in seen_companies:
+            status, _ = process_candidate(candidate, known_domains=known_domains, seen_place_ids=seen_place_ids,
+                                           seen_companies=seen_companies, attempted_domains=attempted_domains)
+            if status == "verified":
+                verified_count += 1
+            elif status == "retry":
+                qrow = next((r for r in load_csv(RETRY_QUEUE_FILE) if normalize_domain(r.get("Domain", "")) == domain), {})
+                reason = qrow.get("LastReason", "")
+                if reason == "no_public_email":
+                    email_missing += 1
+                elif reason == "llm_temporary_failure":
+                    llm_retry += 1
+                else:
+                    website_failed += 1
+            elif status == "rejected":
                 rejected += 1
-                continue
-
-            known_domains.add(domain)
-            remember_domain(domain)
-            processed += 1
-            print(f"  [Research] {candidate.company} -> {candidate.website}")
-
-            research = website_research(candidate.website)
-            if not research:
-                rejected += 1
-                continue
-            findings, facts = research
-            public_email = choose_public_business_email(findings, candidate.website)
-            if not public_email:
-                print("    [Skip] no verified public business email")
-                rejected += 1
-                continue
-
-            qualified = llm_qualify(candidate, facts, public_email)
-            if not qualified:
-                print("    [Skip] LLM qualification rejected/uncertain")
-                rejected += 1
-                continue
-            state = state_from_address(candidate.address)
-            city = city_from_address(candidate.address, state)
-            row = {
-                "Email": public_email.email,
-                "Company": qualified["company_name"],
-                "Website": candidate.website,
-                "City": city,
-                "State": state,
-                "Timezone": state_timezone(state),
-                "LeadSource": "Google Places Text Search -> public website",
-                "Verified": "PASS",
-                "PlaceId": candidate.place_id,
-                "EmailSourceURL": public_email.source_url,
-                "WebsiteFacts": facts[:6000],
-                "ScaleClass": qualified["scale_class"],
-                "QualificationConfidence": str(qualified["confidence"]),
-                "Status": "Verified",
-                "FirstSeenDate": iso_now(),
-                "Notes": qualified["reason"],
-            }
-            if already_in_crm(public_email.email, domain, qualified["company_name"]):
-                rejected += 1
-                continue
-            append_csv(CRM_FILE, CRM_HEADERS, row)
-            seen_place_ids.add(candidate.place_id)
-            seen_companies.add(normalize_company(qualified["company_name"]))
-            verified_count += 1
-            append_jsonl(MEMORY_FILE, {
-                "event": "verified_lead",
-                "place_id": candidate.place_id,
-                "domain_sha256": hashlib.sha256(domain.encode()).hexdigest(),
-                "email": public_email.email,
-                "qualification": qualified,
-            })
-            print(f"    [VERIFIED {verified_count}/{TARGET_VERIFIED_LEADS}] {public_email.email}")
+            else:
+                duplicate_count += 1
         time.sleep(max(0, SEARCH_DELAY_SECONDS))
 
+    retry_rows_count = len(load_csv(RETRY_QUEUE_FILE))
     summary = {
         "seed": seed, "verified_leads": verified_count, "target": TARGET_VERIFIED_LEADS,
         "places_search_calls": search_calls, "unique_raw_candidates": len(raw_seen),
-        "processed_candidates": processed, "rejected": rejected,
+        "processed_candidates": len(attempted_domains), "rejected": rejected,
+        "email_missing": email_missing, "website_failed": website_failed,
+        "llm_retry": llm_retry, "duplicates": duplicate_count,
+        "retry_queue_rows": retry_rows_count,
         "duration_seconds": round(time.time() - start, 2),
     }
     append_jsonl(RUN_LOG_FILE, summary)
@@ -668,10 +1003,12 @@ def main() -> None:
     for k, v in summary.items():
         print(f"  {k}: {v}")
     if verified_count < TARGET_VERIFIED_LEADS:
-        print(f"[INFO] Target not reached this run ({verified_count}/{TARGET_VERIFIED_LEADS}).")
+        print(f"[INFO] Target not reached this run ({verified_count}/{TARGET_VERIFIED_LEADS}). Recoverable failures are queued for retry.")
     else:
         print(f"[DONE] Collected {verified_count} verified leads.")
 
 
+if __name__ == "__main__":
+    main()
 if __name__ == "__main__":
     main()
