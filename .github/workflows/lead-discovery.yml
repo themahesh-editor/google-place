@@ -45,12 +45,17 @@ jobs:
           GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
           TARGET_VERIFIED_LEADS: 100
           MAX_PLACES_SEARCH_REQUESTS: 30
-          MAX_RAW_CANDIDATES: 250
+          MAX_RAW_CANDIDATES: 500
           SEARCH_PAGE_SIZE: 20
           SEARCH_DELAY_SECONDS: 2
-          MAX_PAGES_PER_WEBSITE: 5
+          MAX_PAGES_PER_WEBSITE: 10
           HTTP_TIMEOUT_SECONDS: 15
           HONOR_ROBOTS: 'true'
+          WEBSITE_REQUEST_DELAY_SECONDS: 0.25
+          NO_EMAIL_RETRY_DAYS: 7
+          TRANSIENT_RETRY_DAYS: 1
+          MAX_RETRY_CANDIDATES_PER_RUN: 50
+          RETRY_QUEUE_FILE: retry_queue.csv
         run: python lead_collector.py
 
       - name: Commit CRM and memory
@@ -58,7 +63,7 @@ jobs:
         run: |
           git config user.name "Lead Discovery Bot"
           git config user.email "actions@github.com"
-          git add leads_crm.csv seen_domains.csv candidate_memory.jsonl run_log.jsonl
+          git add leads_crm.csv seen_domains.csv candidate_memory.jsonl retry_queue.csv run_log.jsonl
           git diff --cached --quiet && exit 0
           git commit -m "Update verified lead discovery data [skip ci]"
           git push
