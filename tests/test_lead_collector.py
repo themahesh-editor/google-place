@@ -61,6 +61,36 @@ class LeadCollectorTests(unittest.TestCase):
                 self.assertEqual(obj["place_id"], "x")
                 self.assertIn("timestamp_utc", obj)
 
+    def test_email_extraction_finds_contact_page_patterns_and_jsonld(self):
+        html = """
+        <html><body>
+          <a href="mailto:info@example.com">Email us</a>
+          <p>Or contact us at support [at] example [dot] com</p>
+          <script type="application/ld+json">
+            {"@context":"https://schema.org","contactPoint":{"email":"sales@example.com"}}
+          </script>
+        </body></html>
+        """
+        emails = {x.email for x in m.extract_emails("https://example.com/contact", html)}
+        self.assertIn("info@example.com", emails)
+        self.assertIn("support@example.com", emails)
+        self.assertIn("sales@example.com", emails)
+
+    def test_cloudflare_email_decode(self):
+        email = "info@example.com"
+        key = 0x12
+        encoded = f"{key:02x}" + "".join(f"{ord(ch)^key:02x}" for ch in email)
+        self.assertEqual(m.decode_cloudflare_email(encoded), email)
+
+    def test_seen_domains_only_permanently_blocks_verified(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "seen_domains.csv"
+            path.write_text("Domain,FirstSeenUTC,Source\nold-example.com,x,test\n", encoding="utf-8")
+            with patch.object(m, "SEEN_DOMAINS_FILE", path):
+                self.assertNotIn("old-example.com", m.seen_domains())
+                path.write_text("Domain,FirstSeenUTC,Source,Status\nold-example.com,x,test,VERIFIED\n", encoding="utf-8")
+                self.assertIn("old-example.com", m.seen_domains())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
