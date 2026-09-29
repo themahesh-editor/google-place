@@ -270,6 +270,10 @@ def llm_chat(system_prompt: str, user_prompt: str, max_tokens: int) -> str | Non
                 print(f"[NVIDIA] HTTP {r.status_code}; retrying in {delay}s")
                 time.sleep(delay)
                 continue
+
+            if r.status_code >= 400:
+                print(f"[Places DEBUG] HTTP {r.status_code}")
+                print(f"[Places DEBUG] Response: {r.text}")
             r.raise_for_status()
             data = r.json()
             content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
