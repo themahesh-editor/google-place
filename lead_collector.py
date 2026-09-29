@@ -402,6 +402,8 @@ def deterministic_queries(seed: str, count: int = 100) -> list[str]:
                 return out
     return out
 
+def choose_seed() -> str:
+    return SEED_KEYWORDS[dt.date.today().toordinal() % len(SEED_KEYWORDS)]
 
 def query_has_city(query: str) -> bool:
     low = query.lower()
