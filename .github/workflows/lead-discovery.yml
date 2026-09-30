@@ -17,6 +17,7 @@ jobs:
   discover:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -42,8 +43,15 @@ jobs:
           NVIDIA_MODEL: nvidia/nemotron-3-ultra-550b-a55b
           NVIDIA_TIMEOUT_SECONDS: 180
           NVIDIA_MAX_TOKENS: 1500
+
           GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+
+          # Experiment target
           TARGET_VERIFIED_LEADS: 10
+
+          # Allowed global countries
+          ALLOWED_COUNTRY_CODES: US,CA,GB,AU
+
           MAX_PLACES_SEARCH_REQUESTS: 30
           MAX_RAW_CANDIDATES: 500
           SEARCH_PAGE_SIZE: 20
@@ -56,6 +64,7 @@ jobs:
           TRANSIENT_RETRY_DAYS: 1
           MAX_RETRY_CANDIDATES_PER_RUN: 50
           RETRY_QUEUE_FILE: retry_queue.csv
+
         run: python lead_collector.py
 
       - name: Commit CRM and memory
@@ -63,8 +72,13 @@ jobs:
         run: |
           git config user.name "Lead Discovery Bot"
           git config user.email "actions@github.com"
+
           git add leads_crm.csv seen_domains.csv candidate_memory.jsonl retry_queue.csv run_log.jsonl
+
           git diff --cached --quiet && exit 0
+
           git commit -m "Update verified lead discovery data [skip ci]"
+
           git pull --rebase origin main
+
           git push origin HEAD:main
