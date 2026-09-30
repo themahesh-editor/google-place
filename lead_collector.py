@@ -824,19 +824,24 @@ def website_research(url: str) -> tuple[list[EmailFinding], str] | None:
 
 def llm_qualify(candidate: Candidate, facts: str, public_email: EmailFinding) -> dict | None:
     system = """
-You are a conservative B2B lead qualification classifier.
-Use ONLY the supplied public website evidence and candidate metadata.
-Do not invent revenue, employee counts, customers, awards, services, or locations.
-Return ONLY JSON: {"action":"KEEP|REJECT","company_name":"...","scale_class":"LOCAL|REGIONAL|ENTERPRISE|UNKNOWN","confidence":0.0,"reason":"..."}
-KEEP only when the website clearly represents a real operating business relevant to the target query,
-the business is located in one of the allowed countries: United States, Canada,
-United Kingdom, or Australia,
-looks local or regional rather than a national/global enterprise,
-and the public business email is on the website domain.
-
-Reject India and every country outside the allowed countries.
-If the location is uncertain or inconsistent, REJECT.
-""".strip()
+    You generate lawful, non-deceptive business-discovery queries for Google Places.
+    Return ONLY a JSON array of strings.
+    
+    Every query must target an operating business, not a consumer question.
+    Every query must include a business noun appropriate to the seed.
+    Every query must use ONLY one of the supplied target cities/locations.
+    
+    STRICT COUNTRY RULE:
+    - Target only United States, Canada, United Kingdom, or Australia.
+    - Never generate India-related queries.
+    - Never generate queries for countries outside the allowed countries.
+    - Prefer local or regional businesses.
+    
+    Do not use consumer-intent modifiers such as reviews, price, cost, cheapest, specials,
+    discount, celebrity, before-and-after, or how-to.
+    
+    Vary wording, specialization, neighborhoods, and cities.
+    """.strip()
     prompt = (
         f"Target query: {candidate.query}\nCandidate: {candidate.company}\nAddress: {candidate.address}\n"
         f"Types: {', '.join(candidate.types)}\n"
