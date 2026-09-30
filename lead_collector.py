@@ -29,7 +29,7 @@ NVIDIA_MAX_TOKENS = int(os.getenv("NVIDIA_MAX_TOKENS", "1500"))
 GOOGLE_PLACES_API_KEY = os.getenv("GOOGLE_PLACES_API_KEY", "").strip()
 GOOGLE_PLACES_URL = "https://places.googleapis.com/v1/places:searchText"
 
-TARGET_VERIFIED_LEADS = int(os.getenv("TARGET_VERIFIED_LEADS", "100"))
+TARGET_VERIFIED_LEADS = int(os.getenv("TARGET_VERIFIED_LEADS", "10"))
 MAX_PLACES_SEARCH_REQUESTS = int(os.getenv("MAX_PLACES_SEARCH_REQUESTS", "30"))
 MAX_RAW_CANDIDATES = int(os.getenv("MAX_RAW_CANDIDATES", "500"))
 SEARCH_PAGE_SIZE = min(20, max(1, int(os.getenv("SEARCH_PAGE_SIZE", "20"))))
