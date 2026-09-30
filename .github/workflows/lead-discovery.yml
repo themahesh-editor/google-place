@@ -66,4 +66,5 @@ jobs:
           git add leads_crm.csv seen_domains.csv candidate_memory.jsonl retry_queue.csv run_log.jsonl
           git diff --cached --quiet && exit 0
           git commit -m "Update verified lead discovery data [skip ci]"
-          git push
+          git pull --rebase origin main
+          git push origin HEAD:main
