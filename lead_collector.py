@@ -59,15 +59,35 @@ SEED_KEYWORDS = [
 ]
 
 TARGET_CITIES = [
-    "Dallas TX", "Fort Worth TX", "Houston TX", "Austin TX", "San Antonio TX", "Orlando FL", "Tampa FL",
-    "Jacksonville FL", "Miami FL", "Atlanta GA", "Charlotte NC", "Nashville TN", "Phoenix AZ", "Denver CO",
-    "Las Vegas NV", "Los Angeles CA", "San Diego CA", "Sacramento CA", "Chicago IL", "Columbus OH",
-    "Indianapolis IN", "Cleveland OH", "Kansas City MO", "Raleigh NC", "Richmond VA", "Seattle WA",
-    "Portland OR", "Salt Lake City UT", "Minneapolis MN", "Boston MA",
+    # United States
+    "Dallas TX", "Fort Worth TX", "Houston TX", "Austin TX", "San Antonio TX",
+    "Orlando FL", "Tampa FL", "Jacksonville FL", "Miami FL", "Atlanta GA",
+    "Charlotte NC", "Nashville TN", "Phoenix AZ", "Denver CO", "Las Vegas NV",
+    "Los Angeles CA", "San Diego CA", "Sacramento CA", "Chicago IL", "Columbus OH",
+    "Indianapolis IN", "Cleveland OH", "Kansas City MO", "Raleigh NC", "Richmond VA",
+    "Seattle WA", "Portland OR", "Salt Lake City UT", "Minneapolis MN", "Boston MA",
+
+    # Canada
+    "Toronto Canada", "Vancouver Canada", "Montreal Canada",
+    "Calgary Canada", "Ottawa Canada", "Edmonton Canada",
+
+    # United Kingdom
+    "London UK", "Manchester UK", "Birmingham UK",
+    "Leeds UK", "Liverpool UK", "Glasgow UK",
+
+    # Australia
+    "Sydney Australia", "Melbourne Australia", "Brisbane Australia",
+    "Perth Australia", "Adelaide Australia",
 ]
 
+ALLOWED_COUNTRY_CODES = {
+    code.strip().upper()
+    for code in os.getenv("ALLOWED_COUNTRY_CODES", "US,CA,GB,AU").split(",")
+    if code.strip()
+}
+
 RETRY_QUEUE_HEADERS = [
-    "Domain", "PlaceId", "Company", "Website", "Address", "Types", "Query",
+    "Domain", "PlaceId", "Company", "Website", "Address", "CountryCode", "Types", "Query",
     "LastReason", "Attempts", "NextRetryUTC",
 ]
 
@@ -102,7 +122,7 @@ class Candidate:
     address: str
     types: list[str]
     query: str
-
+    country_code: str = ""
 
 @dataclass
 class EmailFinding:
@@ -160,6 +180,24 @@ def city_from_address(address: str, state: str) -> str:
             return m.group(1).strip()
     parts = [p.strip() for p in s.split(",") if p.strip()]
     return parts[-2] if len(parts) >= 2 else ""
+
+def place_country_code(place: dict) -> str:
+    postal = place.get("postalAddress") or {}
+    code = str(postal.get("regionCode") or "").strip().upper()
+    if code:
+        return code
+
+    for component in place.get("addressComponents") or []:
+        if "country" in (component.get("types") or []):
+            code = str(
+                component.get("shortText")
+                or component.get("longText")
+                or ""
+            ).strip().upper()
+            if code in ALLOWED_COUNTRY_CODES:
+                return code
+
+    return ""
 
 
 def state_timezone(state: str) -> str:
@@ -275,6 +313,7 @@ def schedule_retry(candidate: Candidate, reason: str, days: int) -> None:
         "Company": candidate.company,
         "Website": candidate.website,
         "Address": candidate.address,
+        "CountryCode": candidate.country_code,
         "Types": json.dumps(candidate.types),
         "Query": candidate.query,
         "LastReason": reason,
@@ -419,17 +458,31 @@ BUSINESS_NOUNS = (
 
 
 def expand_queries(seed: str, count: int = 100) -> list[str]:
-    system = """
+system = """
 You generate lawful, non-deceptive business-discovery queries for Google Places.
 Return ONLY a JSON array of strings.
+
 Every query must target an operating business, not a consumer question.
-Every query must include a business noun appropriate to the seed (such as contractor, company,
-firm, clinic, dentist, practice, agency, brokerage, or service provider) and a city or locality.
-Do not use consumer-intent modifiers such as reviews, price, cost, cheapest, specials, discount,
-celebrity, before-and-after, or how-to. Vary wording, specialization, neighborhoods, and cities.
-Prefer local or regional businesses.
+Every query must include a business noun appropriate to the seed.
+Every query must use ONLY one of the supplied target cities/locations.
+
+STRICT COUNTRY RULE:
+- Target only United States, Canada, United Kingdom, or Australia.
+- Never generate India-related queries.
+- Never generate queries for countries outside the allowed countries.
+- Prefer local or regional businesses.
+
+Do not use consumer-intent modifiers such as reviews, price, cost, cheapest, specials,
+discount, celebrity, before-and-after, or how-to.
+
+Vary wording, specialization, neighborhoods, and cities.
 """.strip()
-    prompt = f"Seed niche: {seed}\nCities: {', '.join(TARGET_CITIES)}\nGenerate {count} unique concise queries."
+    prompt = (
+        f"Seed niche: {seed}\n"
+        f"Allowed target cities/locations: {', '.join(TARGET_CITIES)}\n"
+        f"Allowed country codes: {', '.join(sorted(ALLOWED_COUNTRY_CODES))}\n"
+        f"Generate {count} unique concise queries."
+    )
     raw = llm_chat(system, prompt, NVIDIA_MAX_TOKENS)
     out, seen = [], set()
     for q in parse_json_array(raw or ""):
@@ -460,9 +513,9 @@ def places_search(query: str) -> list[dict]:
     headers = {
         "Content-Type": "application/json",
         "X-Goog-Api-Key": GOOGLE_PLACES_API_KEY,
-        "X-Goog-FieldMask": "places.id,places.displayName,places.formattedAddress,places.websiteUri,places.types,places.businessStatus",
+        "X-Goog-FieldMask": (     "places.id,"     "places.displayName,"     "places.formattedAddress,"     "places.postalAddress,"     "places.addressComponents,"     "places.websiteUri,"     "places.types,"     "places.businessStatus" ),
     }
-    payload = {"textQuery": query, "pageSize": SEARCH_PAGE_SIZE, "languageCode": "en", "regionCode": "US"}
+    payload = {     "textQuery": query,     "pageSize": SEARCH_PAGE_SIZE,     "languageCode": "en", }
     for attempt in range(3):
         try:
             r = session.post(GOOGLE_PLACES_URL, headers=headers, json=payload, timeout=HTTP_TIMEOUT_SECONDS)
@@ -776,12 +829,20 @@ Use ONLY the supplied public website evidence and candidate metadata.
 Do not invent revenue, employee counts, customers, awards, services, or locations.
 Return ONLY JSON: {"action":"KEEP|REJECT","company_name":"...","scale_class":"LOCAL|REGIONAL|ENTERPRISE|UNKNOWN","confidence":0.0,"reason":"..."}
 KEEP only when the website clearly represents a real operating business relevant to the target query,
-looks local or regional rather than a national/global enterprise, and the public business email is on the website domain.
-When uncertain, REJECT.
+the business is located in one of the allowed countries: United States, Canada,
+United Kingdom, or Australia,
+looks local or regional rather than a national/global enterprise,
+and the public business email is on the website domain.
+
+Reject India and every country outside the allowed countries.
+If the location is uncertain or inconsistent, REJECT.
 """.strip()
     prompt = (
         f"Target query: {candidate.query}\nCandidate: {candidate.company}\nAddress: {candidate.address}\n"
-        f"Types: {', '.join(candidate.types)}\nWebsite: {candidate.website}\nPublic email: {public_email.email}\n"
+        f"Types: {', '.join(candidate.types)}\n"
+        f"Country code: {candidate.country_code}\n"
+        f"Website: {candidate.website}\n"
+        f"Public email: {public_email.email}\n"
         f"Website evidence:\n{facts[:10000]}"
     )
     raw = llm_chat(system, prompt, 900)
@@ -832,9 +893,30 @@ def candidate_from_place(place: dict, query: str) -> Candidate | None:
     website = canonical_url(str(place.get("websiteUri") or "").strip())
     types = [str(x) for x in (place.get("types") or [])]
     status = str(place.get("businessStatus") or "").upper()
-    if not place_id or not company or not website or status in {"CLOSED", "CLOSED_PERMANENTLY"}:
+    country_code = place_country_code(place)
+
+    if not place_id or not company or not website:
         return None
-    return Candidate(place_id, company, website, address, types, query)
+
+    if status in {"CLOSED", "CLOSED_PERMANENTLY"}:
+        return None
+
+    if country_code not in ALLOWED_COUNTRY_CODES:
+        print(
+            f"    [Skip Country] {company} -> "
+            f"{country_code or 'UNKNOWN'} -> {address}"
+        )
+        return None
+
+    return Candidate(
+        place_id,
+        company,
+        website,
+        address,
+        types,
+        query,
+        country_code,
+    )
 
 
 def candidate_from_retry(row: dict[str, str]) -> Candidate:
@@ -844,13 +926,26 @@ def candidate_from_retry(row: dict[str, str]) -> Candidate:
             types = []
     except Exception:
         types = []
-    return Candidate(row.get("PlaceId", ""), row.get("Company", ""), row.get("Website", ""),
-                     row.get("Address", ""), [str(x) for x in types], row.get("Query", ""))
+    return Candidate(
+        row.get("PlaceId", ""),
+        row.get("Company", ""),
+        row.get("Website", ""),
+        row.get("Address", ""),
+        [str(x) for x in types],
+        row.get("Query", ""),
+        (row.get("CountryCode") or "").strip().upper(),
+    )
 
 
 def process_candidate(candidate: Candidate, *, known_domains: set[str], seen_place_ids: set[str],
                        seen_companies: set[str], attempted_domains: set[str]) -> tuple[str, dict | None]:
     domain = normalize_domain(candidate.website)
+    if candidate.country_code not in ALLOWED_COUNTRY_CODES:
+        print(
+            f"    [Reject Country] {candidate.company} -> "
+            f"{candidate.country_code or 'UNKNOWN'} -> {candidate.address}"
+        )
+        return "rejected", None
     if not domain or domain in known_domains or domain in attempted_domains:
         return "duplicate", None
     if candidate.place_id in seen_place_ids or normalize_company(candidate.company) in seen_companies:
@@ -1016,7 +1111,5 @@ def main() -> None:
         print(f"[DONE] Collected {verified_count} verified leads.")
 
 
-if __name__ == "__main__":
-    main()
 if __name__ == "__main__":
     main()
