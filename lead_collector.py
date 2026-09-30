@@ -605,7 +605,13 @@ def website_pages(home_url: str) -> list[str]:
         final_url, html_doc = first
         soup = BeautifulSoup(html_doc, "html.parser")
         for a in soup.find_all("a", href=True):
+
+        try:
             href = urllib.parse.urljoin(final_url, a.get("href", ""))
+        except (ValueError, TypeError):
+            print(f"    [Skip URL] invalid link: {a.get('href', '')!r}")
+            continue
+            
             x = urllib.parse.urlparse(href)
             if x.scheme not in {"http", "https"} or normalize_domain(x.hostname or "") != host:
                 continue
