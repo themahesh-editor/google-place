@@ -458,52 +458,68 @@ BUSINESS_NOUNS = (
 
 
 def expand_queries(seed: str, count: int = 100) -> list[str]:
-system = """
-You generate lawful, non-deceptive business-discovery queries for Google Places.
-Return ONLY a JSON array of strings.
+    system = """
+    You generate lawful, non-deceptive business-discovery queries for Google Places.
+    Return ONLY a JSON array of strings.
 
-Every query must target an operating business, not a consumer question.
-Every query must include a business noun appropriate to the seed.
-Every query must use ONLY one of the supplied target cities/locations.
+    Every query must target an operating business, not a consumer question.
+    Every query must include a business noun appropriate to the seed.
+    Every query must use ONLY one of the supplied target cities/locations.
 
-STRICT COUNTRY RULE:
-- Target only United States, Canada, United Kingdom, or Australia.
-- Never generate India-related queries.
-- Never generate queries for countries outside the allowed countries.
-- Prefer local or regional businesses.
+    STRICT COUNTRY RULE:
+    - Target only United States, Canada, United Kingdom, or Australia.
+    - Never generate India-related queries.
+    - Never generate queries for countries outside the allowed countries.
+    - Prefer local or regional businesses.
 
-Do not use consumer-intent modifiers such as reviews, price, cost, cheapest, specials,
-discount, celebrity, before-and-after, or how-to.
+    Do not use consumer-intent modifiers such as reviews, price, cost, cheapest, specials,
+    discount, celebrity, before-and-after, or how-to.
 
-Vary wording, specialization, neighborhoods, and cities.
-""".strip()
+    Vary wording, specialization, neighborhoods, and cities.
+    """.strip()
+
     prompt = (
         f"Seed niche: {seed}\n"
         f"Allowed target cities/locations: {', '.join(TARGET_CITIES)}\n"
         f"Allowed country codes: {', '.join(sorted(ALLOWED_COUNTRY_CODES))}\n"
         f"Generate {count} unique concise queries."
     )
+
     raw = llm_chat(system, prompt, NVIDIA_MAX_TOKENS)
     out, seen = [], set()
+
     for q in parse_json_array(raw or ""):
         q = re.sub(r"\s+", " ", q).strip()
         low = q.lower()
-        if not q or any(bad in low for bad in (" review", " reviews", " price", " cost", " cheapest", "specials", "discount", "celebrity", "before and after")):
+
+        if not q or any(
+            bad in low
+            for bad in (
+                " review", " reviews", " price", " cost", " cheapest",
+                "specials", "discount", "celebrity", "before and after"
+            )
+        ):
             continue
+
         if not query_has_city(q):
             continue
+
         if not any(noun in low for noun in BUSINESS_NOUNS):
             continue
+
         if low not in seen:
             seen.add(low)
             out.append(q)
+
     if len(out) < min(count, 30):
         for q in deterministic_queries(seed, count):
             if q.lower() not in seen:
                 seen.add(q.lower())
                 out.append(q)
+
                 if len(out) >= count:
                     break
+
     return out[:count]
 
 
