@@ -459,30 +459,22 @@ BUSINESS_NOUNS = (
 
 def expand_queries(seed: str, count: int = 100) -> list[str]:
     system = """
-    You generate lawful, non-deceptive business-discovery queries for Google Places.
-    Return ONLY a JSON array of strings.
+Create concise Google Places search queries for local or regional businesses.
 
-    Every query must target an operating business, not a consumer question.
-    Every query must include a business noun appropriate to the seed.
-    Every query must use ONLY one of the supplied target cities/locations.
+Return ONLY a JSON array of strings.
 
-    STRICT COUNTRY RULE:
-    - Target only United States, Canada, United Kingdom, or Australia.
-    - Never generate India-related queries.
-    - Never generate queries for countries outside the allowed countries.
-    - Prefer local or regional businesses.
-
-    Do not use consumer-intent modifiers such as reviews, price, cost, cheapest, specials,
-    discount, celebrity, before-and-after, or how-to.
-
-    Vary wording, specialization, neighborhoods, and cities.
-    """.strip()
+Rules:
+- Use the supplied target cities only.
+- Use a business term related to the seed.
+- Prefer independent/local businesses.
+- Do not generate reviews, price, cost, discount, or how-to searches.
+""".strip()
 
     prompt = (
-        f"Seed niche: {seed}\n"
-        f"Allowed target cities/locations: {', '.join(TARGET_CITIES)}\n"
-        f"Allowed country codes: {', '.join(sorted(ALLOWED_COUNTRY_CODES))}\n"
-        f"Generate {count} unique concise queries."
+        f"Seed: {seed}\n"
+        f"Target cities: {', '.join(TARGET_CITIES)}\n"
+        f"Allowed countries: {', '.join(sorted(ALLOWED_COUNTRY_CODES))}\n"
+        f"Generate {count} queries."
     )
 
     raw = llm_chat(system, prompt, NVIDIA_MAX_TOKENS)
@@ -840,33 +832,31 @@ def website_research(url: str) -> tuple[list[EmailFinding], str] | None:
 
 def llm_qualify(candidate: Candidate, facts: str, public_email: EmailFinding) -> dict | None:
     system = """
-    You generate lawful, non-deceptive business-discovery queries for Google Places.
-    Return ONLY a JSON array of strings.
-    
-    Every query must target an operating business, not a consumer question.
-    Every query must include a business noun appropriate to the seed.
-    Every query must use ONLY one of the supplied target cities/locations.
-    
-    STRICT COUNTRY RULE:
-    - Target only United States, Canada, United Kingdom, or Australia.
-    - Never generate India-related queries.
-    - Never generate queries for countries outside the allowed countries.
-    - Prefer local or regional businesses.
-    
-    Do not use consumer-intent modifiers such as reviews, price, cost, cheapest, specials,
-    discount, celebrity, before-and-after, or how-to.
-    
-    Vary wording, specialization, neighborhoods, and cities.
-    """.strip()
+You are a simple business lead classifier.
+
+Return ONLY JSON:
+{"action":"KEEP|REJECT","company_name":"...","scale_class":"LOCAL|REGIONAL","confidence":0.0,"reason":"..."}
+
+KEEP when:
+- the business matches the target query
+- it appears to be a real local or regional business
+
+The country and email domain have already been checked by the program.
+Use the supplied website evidence and candidate information.
+Do not require perfect evidence.
+""".strip()
+
     prompt = (
-        f"Target query: {candidate.query}\nCandidate: {candidate.company}\nAddress: {candidate.address}\n"
-        f"Types: {', '.join(candidate.types)}\n"
-        f"Country code: {candidate.country_code}\n"
+        f"Target: {candidate.query}\n"
+        f"Company: {candidate.company}\n"
+        f"Address: {candidate.address}\n"
+        f"Country: {candidate.country_code}\n"
         f"Website: {candidate.website}\n"
-        f"Public email: {public_email.email}\n"
-        f"Website evidence:\n{facts[:10000]}"
+        f"Email: {public_email.email}\n"
+        f"Website evidence:\n{facts[:5000]}"
     )
-    raw = llm_chat(system, prompt, 900)
+
+    raw = llm_chat(system, prompt, 600)
     if not raw:
         print(f"[LLM] temporary qualification failure for {candidate.company}; queued for retry")
         return {"_decision": "RETRY"}
@@ -880,7 +870,7 @@ def llm_qualify(candidate: Candidate, facts: str, public_email: EmailFinding) ->
         confidence = float(obj.get("confidence", 0))
     except (TypeError, ValueError):
         confidence = 0.0
-    if action != "KEEP" or scale not in {"LOCAL", "REGIONAL"} or confidence < 0.75:
+    if action != "KEEP" or scale not in {"LOCAL", "REGIONAL"} or confidence < 0.60:
         return {"_decision": "REJECT"}
     return {
         "_decision": "KEEP",
