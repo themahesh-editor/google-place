@@ -3,7 +3,7 @@ name: Daily Verified Lead Discovery
 on:
   schedule:
     # 23:47 IST / 18:17 UTC; non-zero minute reduces top-of-hour load risk.
-    - cron: '17 18 * * *'
+    - cron: '20 6 * * *'
   workflow_dispatch:
 
 concurrency:
