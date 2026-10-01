@@ -41,8 +41,8 @@ jobs:
           NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
           NVIDIA_BASE_URL: https://integrate.api.nvidia.com/v1
           NVIDIA_MODEL: nvidia/nemotron-3-ultra-550b-a55b
-          NVIDIA_TIMEOUT_SECONDS: 180
-          NVIDIA_MAX_TOKENS: 1500
+          NVIDIA_TIMEOUT_SECONDS: 90
+          NVIDIA_MAX_TOKENS: 600
 
           GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
 
@@ -56,13 +56,13 @@ jobs:
           MAX_RAW_CANDIDATES: 500
           SEARCH_PAGE_SIZE: 20
           SEARCH_DELAY_SECONDS: 2
-          MAX_PAGES_PER_WEBSITE: 10
-          HTTP_TIMEOUT_SECONDS: 15
+          MAX_PAGES_PER_WEBSITE: 5
+          HTTP_TIMEOUT_SECONDS: 10
           HONOR_ROBOTS: 'true'
           WEBSITE_REQUEST_DELAY_SECONDS: 0.25
           NO_EMAIL_RETRY_DAYS: 7
           TRANSIENT_RETRY_DAYS: 1
-          MAX_RETRY_CANDIDATES_PER_RUN: 50
+          MAX_RETRY_CANDIDATES_PER_RUN: 10
           RETRY_QUEUE_FILE: retry_queue.csv
 
         run: python lead_collector.py
