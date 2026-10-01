@@ -47,7 +47,7 @@ jobs:
           GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
 
           # Experiment target
-          TARGET_VERIFIED_LEADS: 10
+          TARGET_VERIFIED_LEADS: 2
 
           # Allowed global countries
           ALLOWED_COUNTRY_CODES: US,CA,GB,AU
