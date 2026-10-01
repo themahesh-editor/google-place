@@ -709,7 +709,7 @@ def decode_cloudflare_email(encoded: str) -> str:
 
 
 def html_unescape(text: str) -> str:
-    return BeautifulSoup(text or "", "html.parser").get_text(" ")
+    return html.unescape(text or "")
 
 
 def email_strings(text: str) -> list[str]:
