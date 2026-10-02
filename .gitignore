@@ -1,0 +1,11 @@
+.env
+.env.local
+*.secret
+credentials*
+secrets*
+private_data/
+runtime/
+logs_private/
+__pycache__/
+*.pyc
+.pytest_cache/
