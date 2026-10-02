@@ -221,9 +221,14 @@ class OutreachTests(unittest.TestCase):
     def test_send_validation_fails_without_ten_sender_credentials(self):
         from app.config import Settings
         env={'OUTREACH_DATABASE_URL':'postgresql://x','SEND_ENABLED':'true','DRY_RUN':'false','SENDER_COUNT':'10'}
-        for i in range(1,11): env[f'SENDER_{i}_EMAIL']=f's{i}@example.com'
+        
+        for i in range(1,11):
+            env[f'SENDER_{i}_EMAIL'] = f's{i}@example.com'
+            env[f'SENDER_{i}'] = ''
+        
         with patch.dict(os.environ,env,clear=False):
-            with self.assertRaises(ValueError): Settings.from_env().validate_for_send()
+            with self.assertRaises(ValueError):
+                Settings.from_env().validate_for_send()
 
     def test_parser_preserves_message_metadata_without_body_persistence(self):
         raw=self._raw(body='private reply body'); p=parse_message(raw); self.assertEqual(p.from_email,'owner@a.example'); self.assertEqual(p.received_at_utc,'2026-10-02T12:30:00Z'); self.assertIn('private reply body',p.text_excerpt)
