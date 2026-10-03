@@ -102,8 +102,10 @@ jobs:
       NVIDIA_TIMEOUT_SECONDS: ${{ vars.NVIDIA_TIMEOUT_SECONDS || '90' }}
       NVIDIA_MAX_TOKENS: ${{ vars.NVIDIA_MAX_TOKENS || '1400' }}
       MIN_PERSONALIZATION_CONFIDENCE: ${{ vars.MIN_PERSONALIZATION_CONFIDENCE || '0.75' }}
-      SEND_ENABLED: ${{ inputs.send_enabled }}
-      DRY_RUN: ${{ inputs.dry_run }}
+      RESET_STATE: ${{ github.event_name == 'schedule' && 'false' || inputs.reset_state }}
+      INITIAL_OUTREACH_TARGET: ${{ github.event_name == 'schedule' && '100' || inputs.initial_outreach_target }}
+      SEND_ENABLED: ${{ github.event_name == 'schedule' && 'true' || inputs.send_enabled }}
+      DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
       PYTHONUNBUFFERED: '1'
     steps:
       - name: Checkout
@@ -124,7 +126,7 @@ jobs:
       - name: Execute complete finite system
         run: >-
           python -m app.main
-          --reset-state "${{ inputs.reset_state }}"
-          --initial-target "${{ inputs.initial_outreach_target }}"
-          --send-enabled "${{ inputs.send_enabled }}"
-          --dry-run "${{ inputs.dry_run }}"
+          --reset-state "${{ env.RESET_STATE }}"
+          --initial-target "${{ env.INITIAL_OUTREACH_TARGET }}"
+          --send-enabled "${{ env.SEND_ENABLED }}"
+          --dry-run "${{ env.DRY_RUN }}"
