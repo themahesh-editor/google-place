@@ -323,7 +323,7 @@ evidence_urls must be a subset of supplied URLs.
             f"Current discovery facts: {lead.get('discovery_facts','')[:3000]}\n\nWEBSITE EVIDENCE ONLY\n{blob}"
         )
         try:
-            obj = self.llm.chat_json(self.SYSTEM_PROMPT, prompt, max_tokens=1400)
+            obj = self.llm.chat_json_object(self.SYSTEM_PROMPT, prompt, max_tokens=1400)
         except LLMTemporaryError as exc:
             record = self._record(lead, timestamp, evidence, "PARTIAL_LLM_FAILURE", self.version, error=str(exc))
             self.store.save_research(record)
