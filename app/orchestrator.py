@@ -419,7 +419,7 @@ class Orchestrator:
             "bounces": mailbox.get("bounces", 0),
             "unsubscribes": mailbox.get("unsubscribes", 0),
             "followups_generated": followup.get("generated", 0),
-            "followups_sent": self.store.scalar("SELECT count(*) FROM outreach WHERE workflow_run_id=? AND sequence_type LIKE 'FOLLOWUP_%' AND status='SENT'", [run_id]),
+            "followups_sent": self.store.scalar("SELECT count(*) FROM outreach WHERE workflow_run_id=? AND sequence_type LIKE 'FOLLOWUP_%%' AND status='SENT'", [run_id]),
             "eligible_untouched_after_run": self.store.count_eligible_untouched(),
             "batch_count": initial.get("batches", 0),
         }
