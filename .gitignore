@@ -1,0 +1,10 @@
+.env
+.env.*
+*.secret
+credentials*
+secrets*
+runtime/
+logs_private/
+__pycache__/
+*.pyc
+.pytest_cache/
