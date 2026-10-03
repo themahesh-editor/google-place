@@ -37,11 +37,12 @@ class Orchestrator:
                 self.outer = outer; self.stage_name = stage_name
             def __enter__(self):
                 self.started = time.monotonic()
-                self.outer.stage_starts[self.stage_name] = now_utc()
-                print(f"{self.stage_name}_START={self.outer.stage_starts[self.stage_name]}")
+                self.outer.stage_starts.setdefault(self.stage_name, now_utc())
+                print(f"{self.stage_name}_START={now_utc()}")
             def __exit__(self, exc_type, exc, tb):
+                elapsed = round(time.monotonic() - self.started, 2)
                 self.outer.stage_ends[self.stage_name] = now_utc()
-                self.outer.stage_times[self.stage_name] = round(time.monotonic() - self.started, 2)
+                self.outer.stage_times[self.stage_name] = round(self.outer.stage_times.get(self.stage_name, 0.0) + elapsed, 2)
                 print(f"{self.stage_name}_END={self.outer.stage_ends[self.stage_name]}")
                 print(f"{self.stage_name}_DURATION_SECONDS={self.outer.stage_times[self.stage_name]}")
         return Stage(self, name)
@@ -56,16 +57,12 @@ class Orchestrator:
                 self.store.reset_runtime_state()
             run_id = self.store.start_workflow("MANUAL", reset_state)
             print(f"START_TIME={now_utc()}")
-            self.reconcile_stale_state()
+            self.reconcile_stale_state(run_id)
 
-            with self._stage("DISCOVERY"):
-                discovery_metrics = self.discovery.run(run_id, self.settings.discovery_target)
-
-            with self._stage("PREPARE"):
-                prep = self.prepare_initial_messages(run_id, target)
-
-            with self._stage("SEND"):
-                initial_send = self.send_initial_until_target(run_id, target, send_enabled and not dry_run)
+            initial_phase = self.run_initial_phase(run_id, target, send_enabled and not dry_run)
+            discovery_metrics = initial_phase["discovery"]
+            prep = initial_phase["prep"]
+            initial_send = initial_phase["send"]
 
             with self._stage("MAILBOX"):
                 mailbox = self.sync_mailboxes(run_id, dry_run)
@@ -99,10 +96,76 @@ class Orchestrator:
             print(f"FINAL_END={now_utc()}")
             print(f"TOTAL_RUNTIME_SECONDS={round(time.monotonic() - start_monotonic, 2)}")
 
-    def reconcile_stale_state(self) -> None:
+    def run_initial_phase(self, run_id: str, target: int, allow_real_send: bool) -> dict[str, dict]:
+        """Resume-first initial outreach pipeline. Discovery is a fallback, never the first step when existing work remains."""
+        prep_total = {"prepared": 0, "researched": 0, "personalized": 0, "validated": 0, "rejected": 0}
+        send_total = {"batches": 0, "attempted": 0, "failed": 0, "successful": self.store.count_successful_initials(), "successful_in_run": 0}
+        discovery_total = {"seed": "", "discovered": 0, "verified": 0, "places_search_requests": 0, "rejected": 0, "retryable": 0, "duplicates": 0, "runs": 0, "skipped": 0}
+
+        cycle_limit = max(1, min(self.settings.max_batches_per_run * 4, max(10, target * 2)))
+        for cycle in range(1, cycle_limit + 1):
+            successful = self.store.count_successful_initials()
+            if successful >= target:
+                break
+
+            # Prepare only enough additional work to feed the next batch. This prevents a run from
+            # spending hours personalizing a large pool before the first send can happen.
+            prepare_target = min(target, successful + self.settings.batch_size)
+            if self.store.count_initial_progress() < prepare_target:
+                with self._stage("PREPARE"):
+                    prep = self.prepare_initial_messages(run_id, prepare_target)
+                for key in prep_total:
+                    prep_total[key] += int(prep.get(key, 0))
+
+            print(f"INITIAL_CYCLE={cycle} SUCCESSFUL_BEFORE={successful} TARGET={target} EXISTING_PROGRESS={self.store.count_initial_progress()} UNTOUCHED={self.store.count_eligible_untouched()}")
+            with self._stage("SEND"):
+                sent = self.send_initial_until_target(run_id, target, allow_real_send, max_batches=1)
+            send_total["batches"] += int(sent.get("batches", 0))
+            send_total["attempted"] += int(sent.get("attempted", 0))
+            send_total["failed"] += int(sent.get("failed", 0))
+            send_total["successful"] = int(sent.get("successful", self.store.count_successful_initials()))
+            send_total["successful_in_run"] += int(sent.get("successful_in_run", 0))
+            print(f"INITIAL_CYCLE_END={cycle} SUCCESSFUL_NOW={send_total['successful']} UNFINISHED={self.store.count_unfinished_initials()} UNTOUCHED={self.store.count_eligible_untouched()}")
+            successful = self.store.count_successful_initials()
+            if successful >= target:
+                break
+            if not allow_real_send:
+                print("INITIAL_PHASE_NON_SEND_MODE_STOPPED=true")
+                break
+
+            # Existing queued/scheduled/retryable work gets priority over discovery.
+            unfinished = self.store.count_unfinished_initials()
+            untouched = self.store.count_eligible_untouched()
+            if unfinished > 0:
+                continue
+            if untouched > 0:
+                continue
+
+            # Only after the durable existing pipeline is exhausted do we discover more leads.
+            with self._stage("DISCOVERY"):
+                remaining = max(0, target - successful)
+                discovery_metrics = self.discovery.run(run_id, remaining)
+            discovery_total["runs"] += 1
+            for key in ("discovered", "verified", "places_search_requests", "rejected", "retryable", "duplicates"):
+                discovery_total[key] += int(discovery_metrics.get(key, 0))
+            discovery_total["seed"] = str(discovery_metrics.get("seed", discovery_total["seed"]))
+
+            if int(discovery_metrics.get("verified", 0)) == 0:
+                break
+
+        else:
+            print(f"INITIAL_PHASE_CYCLE_LIMIT_REACHED={cycle_limit}")
+
+        if discovery_total["runs"] == 0:
+            discovery_total["skipped"] = 1
+            discovery_total["skip_reason"] = "existing_initial_pipeline_available_or_target_reached"
+        return {"prep": prep_total, "send": send_total, "discovery": discovery_total}
+
+    def reconcile_stale_state(self, current_run_id: str) -> None:
         cutoff = iso(datetime.now(timezone.utc) - timedelta(hours=2))
-        self.store.execute("UPDATE leads SET status='ELIGIBLE',updated_at_utc=? WHERE status='RESEARCHING' AND updated_at_utc<?", [now_utc(), cutoff])
-        self.store.execute("UPDATE outreach SET status='REVIEW_NEEDED',updated_at_utc=?,last_error='runner_interrupted_while_sending' WHERE status='SENDING' AND updated_at_utc<?", [now_utc(), cutoff])
+        self.store.recover_interrupted_workflow_state(current_run_id)
+        # Old SENDING rows are handled conservatively by the mailer/state recovery path; do not
+        # turn an interrupted, never-confirmed send into a silently resendable message.
         self.store.reconcile_stale_batches(cutoff)
 
     def prepare_initial_messages(self, run_id: str, target: int) -> dict[str, int]:
@@ -120,7 +183,15 @@ class Orchestrator:
             for lead in leads:
                 lead_dict = dict(lead)
                 self.store.add_event("lead_selected", run_id=run_id, lead_id=lead_dict["lead_id"], status="RESEARCHING")
-                record = self.research.run(lead_dict, run_id)
+
+                existing_research = self.store.latest_research(lead_dict["lead_id"])
+                if existing_research and existing_research["research_status"] == "RESEARCHED":
+                    record = existing_research
+                    self.store.update_lead_status(lead_dict["lead_id"], "RESEARCHED")
+                    self.store.add_event("research_reused", run_id=run_id, lead_id=lead_dict["lead_id"], status="RESEARCHED")
+                else:
+                    record = self.research.run(lead_dict, run_id)
+
                 if record["research_status"] != "RESEARCHED":
                     blocked_this_run.add(lead_dict["lead_id"])
                     rejected += 1
@@ -138,13 +209,12 @@ class Orchestrator:
                     continue
                 personalized += 1
                 self.store.add_event("personalization_generated", run_id=run_id, lead_id=lead_dict["lead_id"], status="GENERATED", metadata={"confidence": draft.confidence})
-                previous = []
                 from app.personalization import PersonalizationValidator
-                validation = PersonalizationValidator(self.settings.min_personalization_confidence).validate(lead_dict, record, draft, previous, self.store)
+                validation = PersonalizationValidator(self.settings.min_personalization_confidence).validate(lead_dict, record, draft, [], self.store)
                 if not validation.ok:
                     blocked_this_run.add(lead_dict["lead_id"])
                     rejected += 1
-                    self.store.update_lead_status(lead_dict["lead_id"], "ELIGIBLE")
+                    self.store.update_lead_status(lead_dict["lead_id"], "REVIEW_NEEDED")
                     self.store.add_event("personalization_rejected", run_id=run_id, lead_id=lead_dict["lead_id"], status="FAILED_TERMINAL", reason=validation.reason)
                     continue
                 validated += 1
@@ -155,7 +225,8 @@ class Orchestrator:
                     self.store.add_event("outreach_queued", run_id=run_id, lead_id=lead_dict["lead_id"], outreach_id=oid, sequence_type="INITIAL", status="QUEUED", metadata={"confidence": draft.confidence})
                 else:
                     blocked_this_run.add(lead_dict["lead_id"])
-                    self.store.update_lead_status(lead_dict["lead_id"], "ELIGIBLE")
+                    self.store.update_lead_status(lead_dict["lead_id"], "REVIEW_NEEDED")
+                    self.store.add_event("outreach_queue_rejected", run_id=run_id, lead_id=lead_dict["lead_id"], status="FAILED_TERMINAL", reason="duplicate_or_existing_outreach")
         return {"prepared": prepared, "researched": researched, "personalized": personalized, "validated": validated, "rejected": rejected}
 
     def _within_window(self, when_utc: datetime, lead_timezone: str) -> bool:
@@ -274,32 +345,32 @@ class Orchestrator:
             self.store.add_event("outreach_scheduled", run_id=run_id, lead_id=lead_id, outreach_id=outreach_id, sender_id=sender_id, batch_id=batch_id, status="SCHEDULED", metadata={"scheduled_at_utc": iso(scheduled), "batch_number": batch_number})
         return batch_id, [r for r in self.store.fetchall("SELECT o.*,l.timezone,l.status AS lead_status FROM outreach o JOIN leads l ON l.lead_id=o.lead_id WHERE o.batch_id=? ORDER BY o.sequence_number,o.created_at_utc", [batch_id])]
 
-    def send_initial_until_target(self, run_id: str, target: int, allow_real_send: bool) -> dict[str, int]:
+    def send_initial_until_target(self, run_id: str, target: int, allow_real_send: bool, max_batches: int | None = None) -> dict[str, int]:
         initial_success_total_at_start = self.store.count_successful_initials()
         successful = initial_success_total_at_start
         batches = attempted = failed = 0
-        next_slot = datetime.now(timezone.utc)
+        batch_limit = max_batches if max_batches is not None else self.settings.max_batches_per_run
         if not allow_real_send:
             remaining = max(0, target - successful)
             candidates = self.store.list_ready_initials(min(self.settings.batch_size, remaining))
             if candidates:
-                batch_id = self.store.create_batch(run_id, 1, "INITIAL", iso(datetime.now(timezone.utc)), len(candidates))
-                sender_ids = [s.sender_id for s in self.settings.sender_configs()]
-                assignments = [(row["outreach_id"], row["lead_id"], sender_ids[i], self.settings.sender_configs()[i].email) for i, row in enumerate(candidates)]
+                batch_number = self.store.next_batch_number(run_id, "INITIAL")
+                batch_id = self.store.create_batch(run_id, batch_number, "INITIAL", iso(datetime.now(timezone.utc)), len(candidates))
+                senders = self.settings.sender_configs()
+                assignments = [(row["outreach_id"], row["lead_id"], senders[i].sender_id, senders[i].email) for i, row in enumerate(candidates)]
                 self.store.assign_batch(batch_id, assignments, iso(datetime.now(timezone.utc)))
                 print(f"DRY_RUN_BATCH_PLANNED={batch_id} planned={len(assignments)}")
                 self.store.requeue_batch_pending(batch_id)
-            return {"batches": 1 if candidates else 0, "attempted": 0, "failed": 0, "successful": successful}
-        for batch_number in range(1, self.settings.max_batches_per_run + 1):
+            return {"batches": 1 if candidates else 0, "attempted": 0, "failed": 0, "successful": successful, "successful_in_run": 0}
+        next_batch_number = self.store.next_batch_number(run_id, "INITIAL")
+        for offset in range(batch_limit):
+            batch_number = next_batch_number + offset
             if successful >= target:
                 break
             need = target - successful
             batch_id, rows = self._create_next_batch(run_id, batch_number, "INITIAL", need)
             if not rows:
-                if self.store.count_initial_progress() >= target or self.store.count_eligible_untouched() == 0:
-                    break
-                self._wait_until(datetime.now(timezone.utc) + timedelta(seconds=1))
-                continue
+                break
             scheduled = parse_utc(rows[0]["scheduled_at_utc"])
             if scheduled > datetime.now(timezone.utc):
                 self._wait_until(scheduled)
@@ -308,14 +379,14 @@ class Orchestrator:
             batch_success = sum(1 for x in result_rows if x.status == "SENT")
             batch_attempted = len([x for x in result_rows if x.status != "DRY_RUN"])
             batch_failed = len([x for x in result_rows if x.status.startswith("FAILED")])
-            attempted += batch_attempted; failed += batch_failed; successful = self.store.count_successful_initials(); batches += 1
+            attempted += batch_attempted
+            failed += batch_failed
+            successful = self.store.count_successful_initials()
+            batches += 1
             batch_status = "COMPLETED" if not any(x.status == "REVIEW_NEEDED" for x in result_rows) else "PARTIAL"
             self.store.update_batch_counts(batch_id, status=batch_status, attempted=batch_attempted, successful=batch_success, failed=batch_failed)
             self.store.requeue_batch_pending(batch_id)
             self.store.add_event("batch_completed", run_id=run_id, batch_id=batch_id, status=batch_status, metadata={"batch_number": batch_number, "scheduled_at_utc": rows[0]["scheduled_at_utc"], "planned": len(rows), "attempted": batch_attempted, "successful": batch_success, "failed": batch_failed, "duration_seconds": round(time.monotonic()-start,2), "senders": [r["sender_id"] for r in rows]})
-            next_slot = scheduled + timedelta(minutes=self.settings.batch_interval_minutes)
-            if successful < target:
-                self._wait_until(next_slot)
         return {"batches": batches, "attempted": attempted, "failed": failed, "successful": successful, "successful_in_run": max(0, successful - initial_success_total_at_start)}
 
     def sync_mailboxes(self, run_id: str, dry_run: bool) -> dict[str, int]:
@@ -422,6 +493,9 @@ class Orchestrator:
             "followups_sent": self.store.scalar("SELECT count(*) FROM outreach WHERE workflow_run_id=? AND sequence_type LIKE 'FOLLOWUP_%%' AND status='SENT'", [run_id]),
             "eligible_untouched_after_run": self.store.count_eligible_untouched(),
             "batch_count": initial.get("batches", 0),
+            "discovery_runs": discovery.get("runs", 0),
+            "discovery_skipped": discovery.get("skipped", 0),
+            "discovery_skip_reason": discovery.get("skip_reason"),
         }
 
     @staticmethod
