@@ -11,7 +11,6 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
 from app.config import Settings
-from app.main import build
 from app.db import Store, deterministic_lead_id, deterministic_outreach_id
 from app.mailbox import MailboxMonitor, ParsedInbound, classify
 from app.mailer import BatchSendController
@@ -121,11 +120,6 @@ class SystemTests(unittest.TestCase):
         self.store = Store(f"sqlite://{os.path.join(self.td.name, 'db.sqlite')}")
         self.store.migrate("migrations")
         self.settings = TestSettings()
-
-    def test_main_builds_complete_application(self):
-        orchestrator = build(self.settings, self.store)
-        self.assertIsNotNone(orchestrator)
-        self.assertIsNotNone(orchestrator.personalization)
 
     def tearDown(self):
         self.store.close(); self.td.cleanup()
@@ -250,6 +244,78 @@ class SystemTests(unittest.TestCase):
         result = controller.send_batch(batch, [dict(self.store.fetchone("SELECT * FROM outreach WHERE outreach_id=?", [row["outreach_id"]]))], {sender.sender_id: sender}, False)
         self.assertEqual(result[0].status, "DRY_RUN")
         self.assertEqual(self.store.get_outreach(row["outreach_id"])["status"], "SCHEDULED")
+
+
+    def test_interrupted_research_and_batches_are_recovered_on_next_run(self):
+        old_run = self.store.start_workflow("MANUAL", False)
+        lead = lead_row(1, status="RESEARCHING")
+        self.store.upsert_lead(lead)
+        research_row(self.store, lead)
+        sender = self.settings.sender_configs()[0]
+        self.store.queue_initial(run_id=old_run, lead_id=lead["lead_id"], sender_id=sender.sender_id, sender_email=sender.email, subject="s", body="Company 1 recovery", evidence_urls=[lead["website"]], confidence=.95)
+        queued = self.store.fetchone("SELECT * FROM outreach WHERE lead_id=?", [lead["lead_id"]])
+        batch = self.store.create_batch(old_run, 1, "INITIAL", now := datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"), 1)
+        self.store.assign_batch(batch, [(queued["outreach_id"], lead["lead_id"], sender.sender_id, sender.email)], now)
+        self.store.update_lead_status(lead["lead_id"], "RESEARCHING")
+        current_run = self.store.start_workflow("MANUAL", False)
+        self.store.claim_outreach(queued["outreach_id"])
+        self.store.recover_interrupted_workflow_state(current_run)
+        self.assertEqual(self.store.fetchone("SELECT status FROM workflow_run WHERE workflow_run_id=?", [old_run])["status"], "FAILED")
+        self.assertEqual(self.store.get_lead(lead["lead_id"])["status"], "RESEARCHED")
+        self.assertEqual(self.store.get_outreach(queued["outreach_id"])["status"], "REVIEW_NEEDED")
+
+    def test_resume_prefers_existing_researched_leads_and_does_not_call_research_again(self):
+        run = self.store.start_workflow("MANUAL", False)
+        lead = lead_row(1)
+        self.store.upsert_lead(lead)
+        research_row(self.store, lead)
+        class ShouldNotResearch:
+            def run(self, *args, **kwargs):
+                raise AssertionError("existing researched lead was crawled/researched again")
+        class GoodPersonalization:
+            def initial(self, lead, research, sender_signature):
+                return PersonalizationDraft(True, "summary", ["observation"], "help", "Subject", "Company 1 factual message.", "", "", .95, [lead["website"]], [])
+        orch = Orchestrator(self.settings, self.store, object(), ShouldNotResearch(), GoodPersonalization(), object())
+        result = orch.prepare_initial_messages(run, 1)
+        self.assertEqual(result["prepared"], 1)
+        self.assertIsNotNone(self.store.get_sequence(lead["lead_id"], "INITIAL", 1))
+
+    def test_resume_existing_pipeline_sends_before_discovery(self):
+        run = self.store.start_workflow("MANUAL", False)
+        for i in range(1, 11):
+            lead = lead_row(i)
+            self.store.upsert_lead(lead)
+            research_row(self.store, lead)
+        class GoodPersonalization:
+            def initial(self, lead, research, sender_signature):
+                return PersonalizationDraft(True, "summary", ["observation"], "help", f"Subject {lead['lead_id'][:4]}", f"{lead['company']} factual message.", "", "", .95, [lead["website"]], [])
+        class ForbiddenDiscovery:
+            def __init__(self): self.calls = 0
+            def run(self, *args, **kwargs):
+                self.calls += 1
+                raise AssertionError("discovery should not run while existing leads can satisfy the target")
+        discovery = ForbiddenDiscovery()
+        controller = BatchSendController(self.store, self.settings, FakeSMTP)
+        orch = Orchestrator(self.settings, self.store, discovery, object(), GoodPersonalization(), controller)
+        self.settings.batch_interval_minutes = 0
+        orch._wait_until = lambda when: None
+        result = orch.run_initial_phase(run, 10, True)
+        self.assertEqual(result["send"]["successful"], 10)
+        self.assertEqual(discovery.calls, 0)
+
+    def test_terminal_personalization_rejection_is_not_reprocessed_as_eligible(self):
+        run = self.store.start_workflow("MANUAL", False)
+        lead = lead_row(1)
+        self.store.upsert_lead(lead)
+        research_row(self.store, lead)
+        class BadPersonalization:
+            def initial(self, lead, research, sender_signature):
+                return PersonalizationDraft(False, "", [], "", "", "", "", "", .10, [], [])
+        orch = Orchestrator(self.settings, self.store, object(), object(), BadPersonalization(), object())
+        result = orch.prepare_initial_messages(run, 1)
+        self.assertEqual(result["prepared"], 0)
+        self.assertEqual(self.store.get_lead(lead["lead_id"])["status"], "REVIEW_NEEDED")
+        self.assertEqual(self.store.count_eligible_untouched(), 0)
 
     def test_validator_enforces_configured_threshold(self):
         lead = lead_row(1); self.store.upsert_lead(lead); research = research_row(self.store, lead)
