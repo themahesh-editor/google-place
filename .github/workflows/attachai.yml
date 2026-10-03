@@ -1,6 +1,8 @@
-name: AttachAI
-
 on:
+  schedule:
+    - cron: '15 3 * * *'
+      timezone: 'Asia/Kolkata'
+
   workflow_dispatch:
     inputs:
       reset_state:
