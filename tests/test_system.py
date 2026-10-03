@@ -11,6 +11,7 @@ from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
 from app.config import Settings
+from app.main import build
 from app.db import Store, deterministic_lead_id, deterministic_outreach_id
 from app.mailbox import MailboxMonitor, ParsedInbound, classify
 from app.mailer import BatchSendController
@@ -120,6 +121,11 @@ class SystemTests(unittest.TestCase):
         self.store = Store(f"sqlite://{os.path.join(self.td.name, 'db.sqlite')}")
         self.store.migrate("migrations")
         self.settings = TestSettings()
+
+    def test_main_builds_complete_application(self):
+        orchestrator = build(self.settings, self.store)
+        self.assertIsNotNone(orchestrator)
+        self.assertIsNotNone(orchestrator.personalization)
 
     def tearDown(self):
         self.store.close(); self.td.cleanup()
