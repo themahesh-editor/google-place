@@ -355,6 +355,6 @@ Use only supplied candidate and website evidence. Do not invent facts.
             self.store.execute("UPDATE discovery_candidate SET status='REJECTED',attempts=?,last_reason='retry_limit_exceeded',next_retry_at_utc=NULL,last_seen_at_utc=? WHERE candidate_id=?", [next_attempt, now_utc(), candidate_id])
             self.store.add_event("discovery_retry_exhausted", run_id=run_id, reason=reason, metadata={"place_id": candidate.place_id, "attempts": next_attempt})
             return
-        next_retry = datetime_from_now(seconds)
+        next_retry = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=seconds)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         self.store.execute("UPDATE discovery_candidate SET status='RETRYABLE',attempts=?,next_retry_at_utc=?,last_reason=?,last_seen_at_utc=? WHERE candidate_id=?", [next_attempt, next_retry, reason, now_utc(), candidate_id])
         self.store.add_event("discovery_retry_scheduled", run_id=run_id, reason=reason, metadata={"place_id": candidate.place_id, "next_retry_at_utc": next_retry, "attempts": next_attempt})
