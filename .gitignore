@@ -1,9 +1,8 @@
 .env
-.env.local
+.env.*
 *.secret
 credentials*
 secrets*
-private_data/
 runtime/
 logs_private/
 __pycache__/
