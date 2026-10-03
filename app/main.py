@@ -17,7 +17,7 @@ def build(settings: Settings, store: Store):
     crawler = WebsiteCrawler(settings.crawler_timeout_seconds, settings.crawler_max_bytes, settings.crawler_max_pages, settings.crawler_request_delay_seconds, settings.honor_robots)
     discovery = DiscoveryService(store, llm, crawler, settings)
     research = ResearchService(store, llm, crawler, "2.0")
-    personalization = PersonalizationGenerator(llm)
+    personalization = PersonalizationGenerator(llm, settings.min_personalization_confidence)
     mailer = BatchSendController(store, settings)
     return Orchestrator(settings, store, discovery, research, personalization, mailer)
 
