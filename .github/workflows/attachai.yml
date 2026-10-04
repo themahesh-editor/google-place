@@ -21,6 +21,11 @@ on:
         required: true
         default: false
         type: boolean
+      reopen_personalization_reviews:
+        description: 'Reopen prior REVIEW_NEEDED leads created by personalization rejection for reprocessing'
+        required: true
+        default: false
+        type: boolean
 
 concurrency:
   group: attachai-manual-production
@@ -81,6 +86,7 @@ jobs:
       MAX_CONCURRENT_SENDS: '10'
       RETRY_LIMIT: ${{ vars.RETRY_LIMIT || '3' }}
       RETRY_BASE_SECONDS: '0'
+      PERSONALIZATION_RETRY_LIMIT: '1'
       SENDING_WINDOW_START: ${{ vars.SENDING_WINDOW_START || '18:00' }}
       SENDING_WINDOW_END: ${{ vars.SENDING_WINDOW_END || '20:00' }}
       SENDING_WINDOW_MODE: ${{ vars.SENDING_WINDOW_MODE || 'recipient' }}
@@ -102,6 +108,7 @@ jobs:
       INITIAL_OUTREACH_TARGET: ${{ inputs.initial_outreach_target }}
       SEND_ENABLED: ${{ inputs.send_enabled }}
       DRY_RUN: ${{ inputs.dry_run }}
+      REOPEN_PERSONALIZATION_REVIEWS: ${{ inputs.reopen_personalization_reviews }}
       ENFORCE_SEND_WINDOW: 'false'
       ENFORCE_DAILY_LIMITS: 'false'
       PYTHONUNBUFFERED: '1'
