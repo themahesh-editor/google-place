@@ -30,6 +30,7 @@ class Orchestrator:
         self.stage_times: dict[str, float] = {}
         self.stage_starts: dict[str, str] = {}
         self.stage_ends: dict[str, str] = {}
+        self.next_batch_allowed_at: datetime | None = None
 
     def _stage(self, name: str):
         class Stage:
@@ -108,8 +109,6 @@ class Orchestrator:
             if successful >= target:
                 break
 
-            # Prepare only enough additional work to feed the next batch. This prevents a run from
-            # spending hours personalizing a large pool before the first send can happen.
             prepare_target = min(target, successful + self.settings.batch_size)
             if self.store.count_initial_progress() < prepare_target:
                 with self._stage("PREPARE"):
@@ -133,7 +132,6 @@ class Orchestrator:
                 print("INITIAL_PHASE_NON_SEND_MODE_STOPPED=true")
                 break
 
-            # Existing queued/scheduled/retryable work gets priority over discovery.
             unfinished = self.store.count_unfinished_initials()
             untouched = self.store.count_eligible_untouched()
             if unfinished > 0:
@@ -141,7 +139,6 @@ class Orchestrator:
             if untouched > 0:
                 continue
 
-            # Only after the durable existing pipeline is exhausted do we discover more leads.
             with self._stage("DISCOVERY"):
                 remaining = max(0, target - successful)
                 discovery_metrics = self.discovery.run(run_id, remaining)
@@ -164,8 +161,6 @@ class Orchestrator:
     def reconcile_stale_state(self, current_run_id: str) -> None:
         cutoff = iso(datetime.now(timezone.utc) - timedelta(hours=2))
         self.store.recover_interrupted_workflow_state(current_run_id)
-        # Old SENDING rows are handled conservatively by the mailer/state recovery path; do not
-        # turn an interrupted, never-confirmed send into a silently resendable message.
         self.store.reconcile_stale_batches(cutoff)
 
     def prepare_initial_messages(self, run_id: str, target: int) -> dict[str, int]:
@@ -230,6 +225,8 @@ class Orchestrator:
         return {"prepared": prepared, "researched": researched, "personalized": personalized, "validated": validated, "rejected": rejected}
 
     def _within_window(self, when_utc: datetime, lead_timezone: str) -> bool:
+        if not self.settings.enforce_send_window:
+            return True
         tz = self.settings.timezone()
         if self.settings.sending_window_mode == "recipient":
             try:
@@ -256,6 +253,8 @@ class Orchestrator:
         return candidate.astimezone(timezone.utc)
 
     def _next_batch_slot(self, after: datetime, lead_timezone: str = "") -> datetime:
+        if not self.settings.enforce_send_window:
+            return after
         tz_name = lead_timezone if self.settings.sending_window_mode == "recipient" else ""
         candidate = self._next_window_start(after, tz_name)
         try:
@@ -289,6 +288,15 @@ class Orchestrator:
         if seconds > 0:
             time.sleep(seconds)
 
+    def _wait_for_next_batch(self) -> None:
+        if self.next_batch_allowed_at:
+            self._wait_until(self.next_batch_allowed_at)
+            self.next_batch_allowed_at = None
+
+    def _arm_batch_gap(self) -> None:
+        minutes = max(0, self.settings.batch_interval_minutes)
+        self.next_batch_allowed_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
+
     def _available_senders(self, at_utc: datetime, is_followup: bool) -> list:
         date_key = at_utc.astimezone(self.settings.timezone()).date().isoformat()
         out = []
@@ -304,15 +312,13 @@ class Orchestrator:
                 if state["health_state"] == "COOLDOWN":
                     self.store.set_sender_health(sender.sender_id, date_key, "HEALTHY", None)
                     state = self.store.sender_day(sender.sender_id, date_key)
-            if int(state["total"]) >= self.settings.daily_total_limit:
-                continue
-            last = state["last_successful_send_utc"]
-            if last and (at_utc - parse_utc(last)).total_seconds() < self.settings.batch_interval_minutes * 60:
-                continue
-            if is_followup and int(state["followups"]) >= self.settings.daily_followup_limit:
-                continue
-            if not is_followup and int(state["initials"]) >= self.settings.daily_initial_limit:
-                continue
+            if self.settings.enforce_daily_limits:
+                if int(state["total"]) >= self.settings.daily_total_limit:
+                    continue
+                if is_followup and int(state["followups"]) >= self.settings.daily_followup_limit:
+                    continue
+                if not is_followup and int(state["initials"]) >= self.settings.daily_initial_limit:
+                    continue
             out.append(sender)
         return out
 
@@ -321,9 +327,12 @@ class Orchestrator:
         candidates = self.store.list_ready_initials(min(50, target_remaining)) if batch_type == "INITIAL" else self.store.list_due_followups(min(50, target_remaining))
         if not candidates:
             return None, []
-        slot_by_id = {row["outreach_id"]: self._next_batch_slot(now, row["timezone"]) for row in candidates}
-        earliest_slot = min(slot_by_id.values())
-        candidates = [row for row in candidates if slot_by_id[row["outreach_id"]] == earliest_slot]
+        if self.settings.enforce_send_window:
+            slot_by_id = {row["outreach_id"]: self._next_batch_slot(now, row["timezone"]) for row in candidates}
+            earliest_slot = min(slot_by_id.values())
+            candidates = [row for row in candidates if slot_by_id[row["outreach_id"]] == earliest_slot]
+        else:
+            earliest_slot = now
         senders = self._available_senders(earliest_slot, batch_type != "INITIAL")
         if not senders:
             return None, []
@@ -368,11 +377,12 @@ class Orchestrator:
             if successful >= target:
                 break
             need = target - successful
+            self._wait_for_next_batch()
             batch_id, rows = self._create_next_batch(run_id, batch_number, "INITIAL", need)
             if not rows:
                 break
             scheduled = parse_utc(rows[0]["scheduled_at_utc"])
-            if scheduled > datetime.now(timezone.utc):
+            if self.settings.enforce_send_window and scheduled > datetime.now(timezone.utc):
                 self._wait_until(scheduled)
             start = time.monotonic()
             result_rows = self.mailer.send_batch(batch_id, rows, {s.sender_id: s for s in self.settings.sender_configs()}, allow_real_send)
@@ -387,6 +397,7 @@ class Orchestrator:
             self.store.update_batch_counts(batch_id, status=batch_status, attempted=batch_attempted, successful=batch_success, failed=batch_failed)
             self.store.requeue_batch_pending(batch_id)
             self.store.add_event("batch_completed", run_id=run_id, batch_id=batch_id, status=batch_status, metadata={"batch_number": batch_number, "scheduled_at_utc": rows[0]["scheduled_at_utc"], "planned": len(rows), "attempted": batch_attempted, "successful": batch_success, "failed": batch_failed, "duration_seconds": round(time.monotonic()-start,2), "senders": [r["sender_id"] for r in rows]})
+            self._arm_batch_gap()
         return {"batches": batches, "attempted": attempted, "failed": failed, "successful": successful, "successful_in_run": max(0, successful - initial_success_total_at_start)}
 
     def sync_mailboxes(self, run_id: str, dry_run: bool) -> dict[str, int]:
@@ -436,7 +447,7 @@ class Orchestrator:
             rows = self.store.list_due_followups(min(self.settings.batch_size, self.settings.daily_followup_limit))
             if not rows:
                 break
-            # Each follow-up batch also uses one message per sender, while preserving the sender identity from the prior stage.
+            self._wait_for_next_batch()
             selected = []
             used_senders = set()
             now = datetime.now(timezone.utc)
@@ -446,16 +457,14 @@ class Orchestrator:
                     continue
                 if row["lead_status"] in TERMINAL_LEAD_STATES:
                     continue
-                if not self._within_window(now, row["timezone"]):
+                if self.settings.enforce_send_window and not self._within_window(now, row["timezone"]):
                     continue
                 selected.append(row); used_senders.add(row["sender_id"])
                 if len(selected) >= self.settings.batch_size:
                     break
             if not selected:
                 break
-            scheduled = max(parse_utc(x["scheduled_at_utc"]) for x in selected if x["scheduled_at_utc"])
-            if scheduled > now:
-                self._wait_until(scheduled)
+            scheduled = now
             batch_id = self.store.create_batch(run_id, batch_number, "FOLLOWUP", iso(scheduled), len(selected))
             self.store.assign_batch(batch_id, [(r["outreach_id"], r["lead_id"], r["sender_id"], r["sender_email"]) for r in selected], iso(scheduled))
             result_rows = self.mailer.send_batch(batch_id, [dict(r) for r in self.store.fetchall("SELECT o.*,l.timezone,l.status AS lead_status FROM outreach o JOIN leads l ON l.lead_id=o.lead_id WHERE o.batch_id=?", [batch_id])], {s.sender_id: s for s in self.settings.sender_configs()}, allow_real_send)
@@ -465,6 +474,7 @@ class Orchestrator:
             self.store.update_batch_counts(batch_id, status="COMPLETED", attempted=attempted, successful=success, failed=failed)
             self.store.requeue_batch_pending(batch_id)
             sent += success; batches += 1
+            self._arm_batch_gap()
         return {"generated": generated, "sent": sent, "batches": batches}
 
     def build_metrics(self, run_id: str, discovery: dict, prep: dict, initial: dict, mailbox: dict, followup: dict, runtime: float) -> dict:
