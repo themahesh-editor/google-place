@@ -1,8 +1,4 @@
 on:
-  schedule:
-    - cron: '15 3 * * *'
-      timezone: 'Asia/Kolkata'
-
   workflow_dispatch:
     inputs:
       reset_state:
@@ -18,12 +14,12 @@ on:
       send_enabled:
         description: 'Allow real SMTP sending'
         required: true
-        default: false
+        default: true
         type: boolean
       dry_run:
         description: 'Simulate sending and skip mailbox network I/O'
         required: true
-        default: true
+        default: false
         type: boolean
 
 concurrency:
@@ -102,11 +98,15 @@ jobs:
       NVIDIA_TIMEOUT_SECONDS: ${{ vars.NVIDIA_TIMEOUT_SECONDS || '90' }}
       NVIDIA_MAX_TOKENS: ${{ vars.NVIDIA_MAX_TOKENS || '1400' }}
       MIN_PERSONALIZATION_CONFIDENCE: ${{ vars.MIN_PERSONALIZATION_CONFIDENCE || '0.75' }}
-      RESET_STATE: ${{ github.event_name == 'schedule' && 'false' || inputs.reset_state }}
-      INITIAL_OUTREACH_TARGET: ${{ github.event_name == 'schedule' && '100' || inputs.initial_outreach_target }}
-      SEND_ENABLED: ${{ github.event_name == 'schedule' && 'true' || inputs.send_enabled }}
-      DRY_RUN: ${{ github.event_name == 'schedule' && 'false' || inputs.dry_run }}
+      RESET_STATE: ${{ inputs.reset_state }}
+      INITIAL_OUTREACH_TARGET: ${{ inputs.initial_outreach_target }}
+      SEND_ENABLED: ${{ inputs.send_enabled }}
+      DRY_RUN: ${{ inputs.dry_run }}
       PYTHONUNBUFFERED: '1'
+      ENFORCE_SEND_WINDOW: 'false'
+      ENFORCE_DAILY_LIMITS: 'false'
+      BATCH_INTERVAL_MINUTES: '10'
+      RETRY_BASE_SECONDS: '0'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
