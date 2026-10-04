@@ -188,18 +188,40 @@ class Orchestrator:
         if self._active_run_id != run_id:
             self._active_run_id = run_id
             self._blocked_initial_leads.clear()
-        prepared = researched = personalized = validated = rejected = personalization_retries = 0
+        prepared = researched = personalized = validated = rejected = (
+            personalization_retries
+        ) = 0
+        
         blocked_this_run = self._blocked_initial_leads
-        max_rounds = max(1, target * 2)
+        
+        prepare_goal = min(
+            target,
+            self.store.count_initial_progress() + self.settings.batch_size,
+        )
+        
+        max_rounds = max(1, self.settings.batch_size * 5)
+        
         for _ in range(max_rounds):
             if self.store.count_successful_initials() >= target:
                 break
-            if self.store.count_initial_progress() >= target:
+        
+            current_progress = self.store.count_initial_progress()
+            if current_progress >= prepare_goal:
                 break
-            leads = self.store.claim_untouched_leads(min(25, max(10, target - prepared)), exclude_ids=tuple(blocked_this_run))
+        
+            remaining = prepare_goal - current_progress
+        
+            leads = self.store.claim_untouched_leads(
+                min(self.settings.batch_size, remaining),
+                exclude_ids=tuple(blocked_this_run),
+            )
+        
             if not leads:
                 break
             for lead in leads:
+                if self.store.count_initial_progress() >= prepare_goal:
+                    break
+            
                 lead_dict = dict(lead)
                 self.store.add_event("lead_selected", run_id=run_id, lead_id=lead_dict["lead_id"], status="RESEARCHING")
 
@@ -220,6 +242,10 @@ class Orchestrator:
                 researched += 1
                 sender_signature = "Best,\nAttachAI"
                 try:
+                    print(
+                        f"PERSONALIZATION_START lead_id={lead_dict['lead_id']} "
+                        f"progress={self.store.count_initial_progress()}/{prepare_goal}"
+                    )
                     draft = self.personalization.initial(lead_dict, record, sender_signature)
                 except Exception as exc:
                     blocked_this_run.add(lead_dict["lead_id"])
