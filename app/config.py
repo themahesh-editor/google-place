@@ -95,7 +95,8 @@ class Settings:
     enforce_send_window: bool
     enforce_daily_limits: bool
     personalization_retry_limit: int
-    
+    reopen_personalization_reviews: bool
+
     @classmethod
     def from_env(cls) -> "Settings":
         tz = _env("APP_TIMEZONE", "Asia/Kolkata")
@@ -142,9 +143,6 @@ class Settings:
             daily_initial_limit=_int("DAILY_INITIAL_LIMIT", 10),
             daily_followup_limit=_int("DAILY_FOLLOWUP_LIMIT", 10),
             daily_total_limit=_int("DAILY_TOTAL_LIMIT", 40),
-            enforce_send_window=_bool("ENFORCE_SEND_WINDOW", True),
-            enforce_daily_limits=_bool("ENFORCE_DAILY_LIMITS", True),
-            personalization_retry_limit=_int("PERSONALIZATION_RETRY_LIMIT", 1),
             max_concurrent_sends=_int("MAX_CONCURRENT_SENDS", 10),
             retry_limit=_int("RETRY_LIMIT", 3),
             retry_base_seconds=_int("RETRY_BASE_SECONDS", 60),
@@ -165,6 +163,10 @@ class Settings:
             send_enabled=_bool("SEND_ENABLED", False),
             dry_run=_bool("DRY_RUN", True),
             reset_state=_bool("RESET_STATE", False),
+            enforce_send_window=_bool("ENFORCE_SEND_WINDOW", True),
+            enforce_daily_limits=_bool("ENFORCE_DAILY_LIMITS", True),
+            personalization_retry_limit=_int("PERSONALIZATION_RETRY_LIMIT", 1),
+            reopen_personalization_reviews=_bool("REOPEN_PERSONALIZATION_REVIEWS", False),
         )
         settings.validate()
         return settings
