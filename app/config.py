@@ -92,6 +92,8 @@ class Settings:
     send_enabled: bool
     dry_run: bool
     reset_state: bool
+    enforce_send_window: bool
+    enforce_daily_limits: bool
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -139,6 +141,8 @@ class Settings:
             daily_initial_limit=_int("DAILY_INITIAL_LIMIT", 10),
             daily_followup_limit=_int("DAILY_FOLLOWUP_LIMIT", 10),
             daily_total_limit=_int("DAILY_TOTAL_LIMIT", 40),
+            enforce_send_window=_bool("ENFORCE_SEND_WINDOW", True),
+            enforce_daily_limits=_bool("ENFORCE_DAILY_LIMITS", True),
             max_concurrent_sends=_int("MAX_CONCURRENT_SENDS", 10),
             retry_limit=_int("RETRY_LIMIT", 3),
             retry_base_seconds=_int("RETRY_BASE_SECONDS", 60),
