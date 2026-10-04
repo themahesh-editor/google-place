@@ -74,13 +74,13 @@ jobs:
       CRAWLER_REQUEST_DELAY_SECONDS: ${{ vars.CRAWLER_REQUEST_DELAY_SECONDS || '0.25' }}
       HONOR_ROBOTS: ${{ vars.HONOR_ROBOTS || 'true' }}
       BATCH_SIZE: '10'
-      BATCH_INTERVAL_MINUTES: ${{ vars.BATCH_INTERVAL_MINUTES || '10' }}
+      BATCH_INTERVAL_MINUTES: '10'
       DAILY_INITIAL_LIMIT: ${{ vars.DAILY_INITIAL_LIMIT || '10' }}
       DAILY_FOLLOWUP_LIMIT: ${{ vars.DAILY_FOLLOWUP_LIMIT || '10' }}
       DAILY_TOTAL_LIMIT: ${{ vars.DAILY_TOTAL_LIMIT || '40' }}
       MAX_CONCURRENT_SENDS: '10'
       RETRY_LIMIT: ${{ vars.RETRY_LIMIT || '3' }}
-      RETRY_BASE_SECONDS: ${{ vars.RETRY_BASE_SECONDS || '60' }}
+      RETRY_BASE_SECONDS: '0'
       SENDING_WINDOW_START: ${{ vars.SENDING_WINDOW_START || '18:00' }}
       SENDING_WINDOW_END: ${{ vars.SENDING_WINDOW_END || '20:00' }}
       SENDING_WINDOW_MODE: ${{ vars.SENDING_WINDOW_MODE || 'recipient' }}
@@ -102,11 +102,9 @@ jobs:
       INITIAL_OUTREACH_TARGET: ${{ inputs.initial_outreach_target }}
       SEND_ENABLED: ${{ inputs.send_enabled }}
       DRY_RUN: ${{ inputs.dry_run }}
-      PYTHONUNBUFFERED: '1'
       ENFORCE_SEND_WINDOW: 'false'
       ENFORCE_DAILY_LIMITS: 'false'
-      BATCH_INTERVAL_MINUTES: '10'
-      RETRY_BASE_SECONDS: '0'
+      PYTHONUNBUFFERED: '1'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
