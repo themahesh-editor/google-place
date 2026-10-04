@@ -1,453 +1,627 @@
 from __future__ import annotations
 
-import hashlib
 import json
-import re
-from urllib.parse import urlparse
+import time
+from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
-from app.llm import LLMClient
-from app.models import PersonalizationDraft, ValidationResult
-
-
-PLACEHOLDER_RE = re.compile(
-    r"(\{\{.*?\}\}|\[(?:NAME|COMPANY|FIRST_NAME|LAST_NAME)\]|\bTODO\b)",
-    re.I,
-)
-URL_RE = re.compile(r"https?://[^\s)\]>\"']+")
-RISK_TERMS = (
-    "you're losing leads",
-    "you are losing leads",
-    "you need ai",
-    "your conversion is poor",
-    "customers are waiting",
-    "opportunities are being missed",
-    "your competitors are using ai",
-)
-RETRYABLE_REASONS = frozenset(
-    {
-        "llm_marked_ineligible",
-        "low_confidence",
-        "weak_personalization",
-        "personalization_anchor_not_used",
-    }
-)
+from app.db import now_utc
+from app.personalization import PersonalizationValidator
 
 
-def normalize_evidence_url(value: str) -> str:
-    try:
-        parsed = urlparse((value or "").strip())
-        scheme = parsed.scheme.lower()
-        if scheme not in {"http", "https"} or not parsed.netloc:
-            return ""
-        host = (parsed.hostname or "").lower().rstrip(".")
-        if not host:
-            return ""
-        port = parsed.port
-    except (TypeError, ValueError):
-        return ""
-    netloc = host
-    if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
-        netloc = f"{host}:{port}"
-    path = parsed.path.rstrip("/") or "/"
-    return f"{scheme}://{netloc}{path}"
+TERMINAL_LEAD_STATES = {"REPLIED", "BOUNCED", "UNSUBSCRIBED", "COMPLETED", "MANUAL_STOP"}
 
 
-def _normalize_text(value: str) -> str:
-    return re.sub(r"\s+", " ", (value or "").strip().lower())
+def parse_utc(value: str) -> datetime:
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
 
 
-def _singularize_token(token: str) -> str:
-    if len(token) > 5 and token.endswith("ies"):
-        return token[:-3] + "y"
-    if len(token) > 4 and token.endswith("es"):
-        return token[:-2]
-    if len(token) > 4 and token.endswith("s") and not token.endswith("ss"):
-        return token[:-1]
-    return token
+def iso(value: datetime) -> str:
+    return value.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
-def _meaningful_tokens(value: str) -> list[str]:
-    stop = {
-        "the",
-        "a",
-        "an",
-        "and",
-        "or",
-        "of",
-        "to",
-        "for",
-        "on",
-        "in",
-        "with",
-        "their",
-        "your",
-        "our",
-        "this",
-        "that",
-        "from",
-        "has",
-        "have",
-        "is",
-        "are",
-        "can",
-        "be",
-    }
-    tokens = re.findall(r"[a-z0-9]+", (value or "").lower())
-    return [_singularize_token(x) for x in tokens if x not in stop and len(x) >= 3]
+class Orchestrator:
+    def __init__(self, settings, store, discovery, research, personalization, mailer):
+        self.settings = settings
+        self.store = store
+        self.discovery = discovery
+        self.research = research
+        self.personalization = personalization
+        self.mailer = mailer
+        self.stage_times: dict[str, float] = {}
+        self.stage_starts: dict[str, str] = {}
+        self.stage_ends: dict[str, str] = {}
+        self.next_batch_allowed_at: datetime | None = None
+        self._blocked_initial_leads: set[str] = set()
+        self._active_run_id: str | None = None
 
+    def _stage(self, name: str):
+        class Stage:
+            def __init__(self, outer, stage_name):
+                self.outer = outer; self.stage_name = stage_name
+            def __enter__(self):
+                self.started = time.monotonic()
+                self.outer.stage_starts.setdefault(self.stage_name, now_utc())
+                print(f"{self.stage_name}_START={now_utc()}")
+            def __exit__(self, exc_type, exc, tb):
+                elapsed = round(time.monotonic() - self.started, 2)
+                self.outer.stage_ends[self.stage_name] = now_utc()
+                self.outer.stage_times[self.stage_name] = round(self.outer.stage_times.get(self.stage_name, 0.0) + elapsed, 2)
+                print(f"{self.stage_name}_END={self.outer.stage_ends[self.stage_name]}")
+                print(f"{self.stage_name}_DURATION_SECONDS={self.outer.stage_times[self.stage_name]}")
+        return Stage(self, name)
 
-def _text_supports_anchor(anchor: str, text: str) -> bool:
-    normalized_anchor = _normalize_text(anchor)
-    normalized_text = _normalize_text(text)
-    if not normalized_anchor or not normalized_text:
-        return False
-    if normalized_anchor in normalized_text:
-        return True
+    def run(self, reset_state: bool, target: int, send_enabled: bool, dry_run: bool) -> dict:
+        start_monotonic = time.monotonic()
+        run_id: str | None = None
+        self._blocked_initial_leads.clear()
+        self._active_run_id = None
+        self.stage_times.clear()
+        self.stage_starts.clear()
+        self.stage_ends.clear()
+        self.next_batch_allowed_at = None
+        try:
+            self.store.migrate("migrations")
+            if reset_state:
+                print("RESET_STATE=true: clearing application runtime tables only")
+                self.store.reset_runtime_state()
+            run_id = self.store.start_workflow("MANUAL", reset_state)
+            print(f"START_TIME={now_utc()}")
+            self.reconcile_stale_state(run_id)
 
-    anchor_tokens = _meaningful_tokens(normalized_anchor)
-    text_tokens = _meaningful_tokens(normalized_text)
-    if not anchor_tokens or not text_tokens:
-        return False
+            if getattr(self.settings, "reopen_personalization_reviews", False):
+                reopened = self.store.reopen_personalization_reviews(max(200, target * 2))
+                for lead_id in reopened:
+                    self.store.add_event(
+                        "personalization_review_reopened",
+                        run_id=run_id,
+                        lead_id=lead_id,
+                        status="REOPENED",
+                        reason="manual_reprocessing_requested",
+                    )
+                print(f"PERSONALIZATION_REVIEWS_REOPENED={len(reopened)}")
 
-    span = len(anchor_tokens)
-    target = [_singularize_token(x) for x in text_tokens]
-    for i in range(0, max(0, len(target) - span + 1)):
-        if target[i : i + span] == anchor_tokens:
+            initial_phase = self.run_initial_phase(run_id, target, send_enabled and not dry_run)
+            discovery_metrics = initial_phase["discovery"]
+            prep = initial_phase["prep"]
+            initial_send = initial_phase["send"]
+
+            with self._stage("MAILBOX"):
+                mailbox = self.sync_mailboxes(run_id, dry_run)
+
+            with self._stage("FOLLOWUP"):
+                followup = self.prepare_and_send_followups(run_id, send_enabled and not dry_run, dry_run)
+
+            metrics = self.build_metrics(run_id, discovery_metrics, prep, initial_send, mailbox, followup, time.monotonic() - start_monotonic)
+            success = metrics["successful_initial_sends"] >= target
+            if metrics["successful_initial_sends"] < target:
+                metrics["target_status"] = "TARGET NOT REACHED"
+                metrics["target_reason"] = self.target_not_reached_reason(metrics)
+                success = False if target > 0 and send_enabled and not dry_run else success
+            else:
+                metrics["target_status"] = "TARGET REACHED"
+                metrics["target_reason"] = "100 successful initial sends reached" if target == 100 else "target reached"
+            metrics["stage_durations_seconds"] = self.stage_times
+            metrics["stage_timestamps"] = {k: {"start": self.stage_starts.get(k), "end": self.stage_ends.get(k)} for k in self.stage_starts}
+            self.store.finish_workflow(run_id, "SUCCESS" if success else "TARGET_NOT_REACHED", metrics)
+            print(json.dumps(metrics, indent=2, ensure_ascii=False))
+            return metrics
+        except Exception as exc:
+            metrics = {"status": "FAILED", "error": exc.__class__.__name__, "message": str(exc), "stage_durations_seconds": self.stage_times}
+            if run_id is not None:
+                try:
+                    self.store.finish_workflow(run_id, "FAILED", metrics)
+                except Exception:
+                    pass
+            raise
+        finally:
+            print(f"FINAL_END={now_utc()}")
+            print(f"TOTAL_RUNTIME_SECONDS={round(time.monotonic() - start_monotonic, 2)}")
+
+    def run_initial_phase(self, run_id: str, target: int, allow_real_send: bool) -> dict[str, dict]:
+        """Resume-first initial outreach pipeline. Discovery is a fallback, never the first step when existing work remains."""
+        prep_total = {"prepared": 0, "researched": 0, "personalized": 0, "validated": 0, "rejected": 0, "personalization_retries": 0}
+        send_total = {"batches": 0, "attempted": 0, "failed": 0, "successful": self.store.count_successful_initials(), "successful_in_run": 0}
+        discovery_total = {"seed": "", "discovered": 0, "verified": 0, "places_search_requests": 0, "rejected": 0, "retryable": 0, "duplicates": 0, "runs": 0, "skipped": 0}
+
+        cycle_limit = max(1, self.settings.max_batches_per_run)
+        for cycle in range(1, cycle_limit + 1):
+            successful = self.store.count_successful_initials()
+            if successful >= target:
+                break
+
+            prepare_target = min(target, successful + self.settings.batch_size)
+            if self.store.count_initial_progress() < prepare_target:
+                with self._stage("PREPARE"):
+                    prep = self.prepare_initial_messages(run_id, prepare_target)
+                for key in prep_total:
+                    prep_total[key] += int(prep.get(key, 0))
+
+            print(f"INITIAL_CYCLE={cycle} SUCCESSFUL_BEFORE={successful} TARGET={target} EXISTING_PROGRESS={self.store.count_initial_progress()} UNTOUCHED={self.store.count_eligible_untouched()}")
+            with self._stage("SEND"):
+                sent = self.send_initial_until_target(run_id, target, allow_real_send, max_batches=1)
+            send_total["batches"] += int(sent.get("batches", 0))
+            send_total["attempted"] += int(sent.get("attempted", 0))
+            send_total["failed"] += int(sent.get("failed", 0))
+            send_total["successful"] = int(sent.get("successful", self.store.count_successful_initials()))
+            send_total["successful_in_run"] += int(sent.get("successful_in_run", 0))
+            print(f"INITIAL_CYCLE_END={cycle} SUCCESSFUL_NOW={send_total['successful']} UNFINISHED={self.store.count_unfinished_initials()} UNTOUCHED={self.store.count_eligible_untouched()}")
+            successful = self.store.count_successful_initials()
+            if successful >= target:
+                break
+            if not allow_real_send:
+                print("INITIAL_PHASE_NON_SEND_MODE_STOPPED=true")
+                break
+
+            unfinished = self.store.count_unfinished_initials()
+            untouched = self.store.count_eligible_untouched()
+            if unfinished > 0:
+                continue
+            if untouched > 0:
+                continue
+
+            with self._stage("DISCOVERY"):
+                remaining = max(0, target - successful)
+                discovery_metrics = self.discovery.run(run_id, remaining)
+            discovery_total["runs"] += 1
+            for key in ("discovered", "verified", "places_search_requests", "rejected", "retryable", "duplicates"):
+                discovery_total[key] += int(discovery_metrics.get(key, 0))
+            discovery_total["seed"] = str(discovery_metrics.get("seed", discovery_total["seed"]))
+
+            if int(discovery_metrics.get("verified", 0)) == 0:
+                break
+
+        else:
+            print(f"INITIAL_PHASE_CYCLE_LIMIT_REACHED={cycle_limit}")
+
+        if discovery_total["runs"] == 0:
+            discovery_total["skipped"] = 1
+            discovery_total["skip_reason"] = "existing_initial_pipeline_available_or_target_reached"
+        return {"prep": prep_total, "send": send_total, "discovery": discovery_total}
+
+    def reconcile_stale_state(self, current_run_id: str) -> None:
+        cutoff = iso(datetime.now(timezone.utc) - timedelta(hours=2))
+        self.store.recover_interrupted_workflow_state(current_run_id)
+        self.store.reconcile_stale_batches(cutoff)
+
+    def prepare_initial_messages(self, run_id: str, target: int) -> dict[str, int]:
+        if self._active_run_id != run_id:
+            self._active_run_id = run_id
+            self._blocked_initial_leads.clear()
+        prepared = researched = personalized = validated = rejected = personalization_retries = 0
+        blocked_this_run = self._blocked_initial_leads
+        max_rounds = max(1, target * 2)
+        for _ in range(max_rounds):
+            if self.store.count_successful_initials() >= target:
+                break
+            if self.store.count_initial_progress() >= target:
+                break
+            leads = self.store.claim_untouched_leads(min(25, max(10, target - prepared)), exclude_ids=tuple(blocked_this_run))
+            if not leads:
+                break
+            for lead in leads:
+                lead_dict = dict(lead)
+                self.store.add_event("lead_selected", run_id=run_id, lead_id=lead_dict["lead_id"], status="RESEARCHING")
+
+                existing_research = self.store.latest_research(lead_dict["lead_id"])
+                if existing_research and existing_research["research_status"] == "RESEARCHED":
+                    record = existing_research
+                    self.store.update_lead_status(lead_dict["lead_id"], "RESEARCHED")
+                    self.store.add_event("research_reused", run_id=run_id, lead_id=lead_dict["lead_id"], status="RESEARCHED")
+                else:
+                    record = self.research.run(lead_dict, run_id)
+
+                if record["research_status"] != "RESEARCHED":
+                    blocked_this_run.add(lead_dict["lead_id"])
+                    rejected += 1
+                    self.store.add_event("research_failed", run_id=run_id, lead_id=lead_dict["lead_id"], status=record["research_status"], reason=record.get("error"))
+                    self.store.update_lead_status(lead_dict["lead_id"], "ELIGIBLE")
+                    continue
+                researched += 1
+                sender_signature = "Best,\nAttachAI"
+                try:
+                    draft = self.personalization.initial(lead_dict, record, sender_signature)
+                except Exception as exc:
+                    blocked_this_run.add(lead_dict["lead_id"])
+                    self.store.update_lead_status(lead_dict["lead_id"], "ELIGIBLE")
+                    self.store.add_event("personalization_failed", run_id=run_id, lead_id=lead_dict["lead_id"], status="FAILED_RETRYABLE", reason=exc.__class__.__name__)
+                    continue
+                personalized += 1
+                self.store.add_event("personalization_generated", run_id=run_id, lead_id=lead_dict["lead_id"], status="GENERATED", metadata={"confidence": draft.confidence})
+                validation = PersonalizationValidator(self.settings.min_personalization_confidence).validate(
+                    lead_dict, record, draft, [], self.store
+                )
+                for retry_index in range(1, getattr(self.settings, "personalization_retry_limit", 0) + 1):
+                    if validation.ok or not validation.retryable:
+                        break
+                    self.store.add_event(
+                        "personalization_retry",
+                        run_id=run_id,
+                        lead_id=lead_dict["lead_id"],
+                        status="RETRYING",
+                        reason=validation.reason,
+                        metadata={"attempt": retry_index, "limit": self.settings.personalization_retry_limit},
+                    )
+                    personalization_retries += 1
+                    try:
+                        draft = self.personalization.repair_initial(
+                            lead_dict, record, draft, validation.reason, sender_signature
+                        )
+                        validation = PersonalizationValidator(self.settings.min_personalization_confidence).validate(
+                            lead_dict, record, draft, [], self.store
+                        )
+                    except Exception as exc:
+                        blocked_this_run.add(lead_dict["lead_id"])
+                        self.store.update_lead_status(lead_dict["lead_id"], "ELIGIBLE")
+                        self.store.add_event(
+                            "personalization_repair_failed",
+                            run_id=run_id,
+                            lead_id=lead_dict["lead_id"],
+                            status="FAILED_RETRYABLE",
+                            reason=exc.__class__.__name__,
+                            metadata={"attempt": retry_index},
+                        )
+                        validation = None
+                        break
+
+                if validation is None:
+                    continue
+                if not validation.ok:
+                    blocked_this_run.add(lead_dict["lead_id"])
+                    rejected += 1
+                    self.store.update_lead_status(lead_dict["lead_id"], "REVIEW_NEEDED")
+                    self.store.add_event(
+                        "personalization_rejected",
+                        run_id=run_id,
+                        lead_id=lead_dict["lead_id"],
+                        status="FAILED_TERMINAL",
+                        reason=validation.reason,
+                    )
+                    continue
+                validated += 1
+                self.store.add_event("personalization_validated", run_id=run_id, lead_id=lead_dict["lead_id"], status="VALIDATED")
+                oid = self.store.queue_initial(run_id=run_id, lead_id=lead_dict["lead_id"], sender_id="UNASSIGNED", sender_email="", subject=draft.subject, body=draft.body, evidence_urls=draft.evidence_urls, confidence=draft.confidence)
+                if oid:
+                    prepared += 1
+                    self.store.add_event("outreach_queued", run_id=run_id, lead_id=lead_dict["lead_id"], outreach_id=oid, sequence_type="INITIAL", status="QUEUED", metadata={"confidence": draft.confidence})
+                else:
+                    blocked_this_run.add(lead_dict["lead_id"])
+                    self.store.update_lead_status(lead_dict["lead_id"], "REVIEW_NEEDED")
+                    self.store.add_event("outreach_queue_rejected", run_id=run_id, lead_id=lead_dict["lead_id"], status="FAILED_TERMINAL", reason="duplicate_or_existing_outreach")
+        return {
+            "prepared": prepared,
+            "researched": researched,
+            "personalized": personalized,
+            "validated": validated,
+            "rejected": rejected,
+            "personalization_retries": personalization_retries,
+        }
+
+    def _within_window(self, when_utc: datetime, lead_timezone: str) -> bool:
+        if not self.settings.enforce_send_window:
             return True
-    return False
-
-
-def _string_list(value, limit: int | None = None, item_limit: int = 500) -> list[str]:
-    if isinstance(value, str):
-        value = [value]
-    if not isinstance(value, list):
-        return []
-    result = []
-    for item in value:
-        text = str(item).strip()
-        if text:
-            result.append(text[:item_limit])
-        if limit is not None and len(result) >= limit:
-            break
-    return result
-
-
-def _parse_bool(value) -> bool:
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    if isinstance(value, (int, float)):
-        return bool(value)
-    return False
-
-
-class PersonalizationValidator:
-    def __init__(self, confidence_threshold: float):
-        self.confidence_threshold = confidence_threshold
-
-    def validate(
-        self,
-        lead,
-        research: dict,
-        draft: PersonalizationDraft,
-        previous_bodies: list[str],
-        store,
-    ) -> ValidationResult:
-        reasons: list[str] = []
-        normalized = _normalize_text(draft.body)
-        body_hash = hashlib.sha256(normalized.encode()).hexdigest()
-
-        if not draft.eligible:
-            reasons.append("llm_marked_ineligible")
-        if not draft.subject.strip():
-            reasons.append("empty_subject")
-        if not draft.body.strip():
-            reasons.append("empty_body")
-        if len(draft.subject) > 160:
-            reasons.append("subject_too_long")
-        if len(draft.body) > 5000:
-            reasons.append("body_too_long")
-        if PLACEHOLDER_RE.search(draft.subject + "\n" + draft.body):
-            reasons.append("placeholder")
-
-        research_map = dict(research) if not isinstance(research, dict) else research
-        evidence_json = research_map.get("evidence_json", "[]")
-        evidence_items = json_items(evidence_json)
-        allowed = {
-            normalize_evidence_url(str(item.get("url") or ""))
-            for item in evidence_items
-            if item.get("url")
-        }
-        allowed.discard("")
-
-        research_parts = [
-            research_map.get("business_summary", ""),
-            research_map.get("important_public_text", ""),
-            research_map.get("services_json", ""),
-            research_map.get("business_facts_json", ""),
-            research_map.get("customer_journey_signals_json", ""),
-            research_map.get("ai_opportunity_signals_json", ""),
-        ]
-        research_parts.extend(
-            f"{item.get('url', '')} {item.get('snippet', '')}" for item in evidence_items
-        )
-        research_text = " ".join(str(x or "") for x in research_parts).lower()
-
-        anchors = [_normalize_text(x) for x in draft.personalization_anchors if str(x).strip()]
-        grounded_anchors = [x for x in anchors if _text_supports_anchor(x, research_text)]
-        body_lower = _normalize_text(draft.body)
-        body_uses_anchor = any(_text_supports_anchor(x, body_lower) for x in grounded_anchors)
-
-        if draft.eligible and not grounded_anchors:
-            reasons.append("weak_personalization")
-        elif draft.eligible and not body_uses_anchor:
-            reasons.append("personalization_anchor_not_used")
-
-        normalized_draft_urls = [normalize_evidence_url(url) for url in draft.evidence_urls]
-        if len(set(normalized_draft_urls)) != len(normalized_draft_urls):
-            reasons.append("duplicate_evidence_urls")
-        if any(not value or value not in allowed for value in normalized_draft_urls):
-            reasons.append("evidence_url_not_in_current_research")
-        if draft.eligible and not normalized_draft_urls:
-            reasons.append("missing_evidence")
-
-        if draft.confidence < self.confidence_threshold:
-            reasons.append("low_confidence")
-
-        if normalized and any(normalized == _normalize_text(body) for body in previous_bodies):
-            reasons.append("duplicate_body")
-        if store.body_hash_exists(body_hash):
-            reasons.append("duplicate_body")
-
-        website = str(lead.get("website") or "")
-        host = (urlparse(website).hostname or "").lower().removeprefix("www.")
-        for url in URL_RE.findall(draft.body):
+        tz = self.settings.timezone()
+        if self.settings.sending_window_mode == "recipient":
             try:
-                url_host = (urlparse(url).hostname or "").lower().removeprefix("www.")
-            except ValueError:
-                url_host = ""
-            if url_host and url_host not in {host, "attachaiassistant.oneapp.dev"}:
-                reasons.append("unsupported_body_url")
+                tz = ZoneInfo(lead_timezone)
+            except Exception:
+                tz = self.settings.timezone()
+        local = when_utc.astimezone(tz)
+        current = local.timetz().replace(tzinfo=None)
+        return self.settings.sending_window_start <= current < self.settings.sending_window_end
 
-        lower = draft.body.lower()
-        if any(term in lower for term in RISK_TERMS):
-            reasons.append("unsupported_claim")
-        if re.search(r"\b(?:system|developer|assistant)\s+prompt\b", lower):
-            reasons.append("prompt_leakage")
-        if "```json" in lower or '"eligible":' in lower or '"confidence":' in lower:
-            reasons.append("json_leakage")
+    def _next_window_start(self, when_utc: datetime, lead_timezone: str = "") -> datetime:
+        tz = self.settings.timezone()
+        if self.settings.sending_window_mode == "recipient" and lead_timezone:
+            try: tz = ZoneInfo(lead_timezone)
+            except Exception: pass
+        local = when_utc.astimezone(tz)
+        start = self.settings.sending_window_start
+        end = self.settings.sending_window_end
+        candidate = local.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
+        if local.timetz().replace(tzinfo=None) >= end:
+            candidate = (local + timedelta(days=1)).replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
+        elif local.timetz().replace(tzinfo=None) < start:
+            candidate = local.replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
+        return candidate.astimezone(timezone.utc)
 
-        unique_reasons = list(dict.fromkeys(reasons))
-        retryable = bool(unique_reasons) and all(reason in RETRYABLE_REASONS for reason in unique_reasons)
-        return ValidationResult(
-            not unique_reasons,
-            ";".join(unique_reasons),
-            body_hash,
-            retryable=retryable,
-        )
+    def _next_batch_slot(self, after: datetime, lead_timezone: str = "") -> datetime:
+        if not self.settings.enforce_send_window:
+            return after
+        tz_name = lead_timezone if self.settings.sending_window_mode == "recipient" else ""
+        candidate = self._next_window_start(after, tz_name)
+        try:
+            tz = ZoneInfo(lead_timezone) if self.settings.sending_window_mode == "recipient" and lead_timezone else self.settings.timezone()
+        except Exception:
+            tz = self.settings.timezone()
+        local_after = after.astimezone(tz)
+        local_candidate = candidate.astimezone(tz)
+        start = self.settings.sending_window_start
+        end = self.settings.sending_window_end
+        base = max(1, self.settings.batch_interval_minutes)
+        if self._within_window(after, lead_timezone):
+            local_candidate = local_after.replace(second=0, microsecond=0)
+            minute = local_candidate.minute
+            needs_step = (minute % base) != 0 or local_after.second != 0 or local_after.microsecond != 0
+            if needs_step:
+                minute = ((minute // base) + 1) * base
+            if minute >= 60:
+                local_candidate = (local_candidate + timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            else:
+                local_candidate = local_candidate.replace(minute=minute, second=0, microsecond=0)
+            if local_candidate < local_after:
+                local_candidate = local_after + timedelta(minutes=base)
+                local_candidate = local_candidate.replace(second=0, microsecond=0)
+        if local_candidate.timetz().replace(tzinfo=None) >= end:
+            local_candidate = (local_candidate + timedelta(days=1)).replace(hour=start.hour, minute=start.minute, second=0, microsecond=0)
+        return local_candidate.astimezone(timezone.utc)
 
+    def _wait_until(self, when_utc: datetime) -> None:
+        seconds = (when_utc - datetime.now(timezone.utc)).total_seconds()
+        if seconds > 0:
+            time.sleep(seconds)
 
-def json_items(raw: str) -> list[dict]:
-    try:
-        value = json.loads(raw or "[]")
-        return value if isinstance(value, list) and all(isinstance(x, dict) for x in value) else []
-    except Exception:
-        return []
+    def _wait_for_next_batch(self) -> None:
+        if self.next_batch_allowed_at:
+            self._wait_until(self.next_batch_allowed_at)
+            self.next_batch_allowed_at = None
 
+    def _arm_batch_gap(self) -> None:
+        minutes = max(0, self.settings.batch_interval_minutes)
+        self.next_batch_allowed_at = datetime.now(timezone.utc) + timedelta(minutes=minutes)
 
-class PersonalizationGenerator:
-    SYSTEM_PROMPT = """
-You write concise, factual B2B outreach for AttachAI.
-Return ONLY JSON with: eligible, personalization_summary, observations, opportunity, personalization_anchors, subject, body, cta, signature, confidence, evidence_urls, risk_flags.
-Use only the current lead, current research, and current outreach history supplied.
-Never invent names, testimonials, technologies, integrations, customer pain, performance claims, or competitor behavior.
-Never claim the company is losing leads, needs AI, has poor conversion, missed opportunities, or that competitors use AI without direct evidence.
-Keep the email concise and professional. No fake urgency, fake identity, fake reply appearance, or deceptive clickbait.
-Evidence URLs must come from current research.
-If current research contains at least one supported business fact, service, customer-journey signal, or website signal that supports a truthful AttachAI use case, set eligible=true.
-If evidence is insufficient for a truthful opportunity, set eligible=false.
-Do not require the company name to appear verbatim in the email.
-Return 1-3 short personalization_anchors. Each anchor must be directly supported by the supplied current research and naturally usable in the email body.
-Possible use cases only when directly supported: answering common questions; handling repetitive website inquiries; helping visitors before booking; directing visitors to services; explaining services; assisting appointment/request flows; collecting basic inquiry information; helping visitors outside business hours.
-""".strip()
+    def _available_senders(self, at_utc: datetime, is_followup: bool) -> list:
+        date_key = at_utc.astimezone(self.settings.timezone()).date().isoformat()
+        out = []
+        for sender in self.settings.sender_configs():
+            state = self.store.sender_day(sender.sender_id, date_key)
+            if state["health_state"] == "STOPPED" or state["health_state"] == "DEGRADED":
+                continue
+            cooldown = state["cooldown_until_utc"]
+            if cooldown:
+                cooldown_at = parse_utc(cooldown)
+                if cooldown_at > at_utc:
+                    continue
+                if state["health_state"] == "COOLDOWN":
+                    self.store.set_sender_health(sender.sender_id, date_key, "HEALTHY", None)
+                    state = self.store.sender_day(sender.sender_id, date_key)
+            if self.settings.enforce_daily_limits:
+                if int(state["total"]) >= self.settings.daily_total_limit:
+                    continue
+                if is_followup and int(state["followups"]) >= self.settings.daily_followup_limit:
+                    continue
+                if not is_followup and int(state["initials"]) >= self.settings.daily_initial_limit:
+                    continue
+            out.append(sender)
+        return out
 
-    FOLLOWUP_SYSTEM_PROMPT = SYSTEM_PROMPT + "\nFor follow-ups, add new useful context, do not repeat the previous message verbatim, and honor the exact sequence."
+    def _create_next_batch(self, run_id: str, batch_number: int, batch_type: str, target_remaining: int) -> tuple[str, list] | tuple[None, list]:
+        now = datetime.now(timezone.utc)
+        candidates = self.store.list_ready_initials(min(50, target_remaining)) if batch_type == "INITIAL" else self.store.list_due_followups(min(50, target_remaining))
+        if not candidates:
+            return None, []
+        if self.settings.enforce_send_window:
+            slot_by_id = {row["outreach_id"]: self._next_batch_slot(now, row["timezone"]) for row in candidates}
+            earliest_slot = min(slot_by_id.values())
+            candidates = [row for row in candidates if slot_by_id[row["outreach_id"]] == earliest_slot]
+        else:
+            earliest_slot = now
+        senders = self._available_senders(earliest_slot, batch_type != "INITIAL")
+        if not senders:
+            return None, []
+        selected = []
+        capacity = min(self.settings.batch_size, len(senders), target_remaining)
+        for row in candidates:
+            if len(selected) >= capacity:
+                break
+            selected.append(row)
+        if not selected:
+            return None, []
+        scheduled = earliest_slot
+        batch_id = self.store.create_batch(run_id, batch_number, batch_type, iso(scheduled), len(selected))
+        assignments = []
+        for sender, row in zip(senders, selected):
+            assignments.append((row["outreach_id"], row["lead_id"], sender.sender_id, sender.email))
+        self.store.assign_batch(batch_id, assignments, iso(scheduled))
+        for outreach_id, lead_id, sender_id, _ in assignments:
+            self.store.add_event("outreach_scheduled", run_id=run_id, lead_id=lead_id, outreach_id=outreach_id, sender_id=sender_id, batch_id=batch_id, status="SCHEDULED", metadata={"scheduled_at_utc": iso(scheduled), "batch_number": batch_number})
+        return batch_id, [r for r in self.store.fetchall("SELECT o.*,l.timezone,l.status AS lead_status FROM outreach o JOIN leads l ON l.lead_id=o.lead_id WHERE o.batch_id=? ORDER BY o.sequence_number,o.created_at_utc", [batch_id])]
 
-    REPAIR_SYSTEM_PROMPT = """
-You repair an AttachAI outreach draft using ONLY the current lead, current research, current outreach history, the prior draft, and the validator problems supplied.
-Return ONLY JSON with: eligible, personalization_summary, observations, opportunity, personalization_anchors, subject, body, cta, signature, confidence, evidence_urls, risk_flags.
-Fix every validator problem that can be repaired while preserving factual accuracy.
-Never invent facts, names, pain points, testimonials, technologies, integrations, performance claims, or competitor behavior.
-Evidence URLs must come from current research only.
-Do not require the company name to appear verbatim.
-A truthful research-backed business fact or service signal is enough to support eligible=true.
-Personalization anchors must be directly supported by current research and must appear naturally in the body.
-Keep the email concise and professional.
-""".strip()
+    def send_initial_until_target(self, run_id: str, target: int, allow_real_send: bool, max_batches: int | None = None) -> dict[str, int]:
+        initial_success_total_at_start = self.store.count_successful_initials()
+        successful = initial_success_total_at_start
+        batches = attempted = failed = 0
+        batch_limit = max_batches if max_batches is not None else self.settings.max_batches_per_run
+        if not allow_real_send:
+            remaining = max(0, target - successful)
+            candidates = self.store.list_ready_initials(min(self.settings.batch_size, remaining))
+            if candidates:
+                batch_number = self.store.next_batch_number(run_id, "INITIAL")
+                batch_id = self.store.create_batch(run_id, batch_number, "INITIAL", iso(datetime.now(timezone.utc)), len(candidates))
+                senders = self.settings.sender_configs()
+                assignments = [(row["outreach_id"], row["lead_id"], senders[i].sender_id, senders[i].email) for i, row in enumerate(candidates)]
+                self.store.assign_batch(batch_id, assignments, iso(datetime.now(timezone.utc)))
+                print(f"DRY_RUN_BATCH_PLANNED={batch_id} planned={len(assignments)}")
+                self.store.requeue_batch_pending(batch_id)
+            return {"batches": 1 if candidates else 0, "attempted": 0, "failed": 0, "successful": successful, "successful_in_run": 0}
+        next_batch_number = self.store.next_batch_number(run_id, "INITIAL")
+        for offset in range(batch_limit):
+            batch_number = next_batch_number + offset
+            if successful >= target:
+                break
+            need = target - successful
+            self._wait_for_next_batch()
+            batch_id, rows = self._create_next_batch(run_id, batch_number, "INITIAL", need)
+            if not rows:
+                break
+            scheduled = parse_utc(rows[0]["scheduled_at_utc"])
+            if self.settings.enforce_send_window and scheduled > datetime.now(timezone.utc):
+                self._wait_until(scheduled)
+            start = time.monotonic()
+            result_rows = self.mailer.send_batch(batch_id, rows, {s.sender_id: s for s in self.settings.sender_configs()}, allow_real_send)
+            batch_success = sum(1 for x in result_rows if x.status == "SENT")
+            batch_attempted = len([x for x in result_rows if x.status != "DRY_RUN"])
+            batch_failed = len([x for x in result_rows if x.status.startswith("FAILED")])
+            attempted += batch_attempted
+            failed += batch_failed
+            successful = self.store.count_successful_initials()
+            batches += 1
+            batch_status = "COMPLETED" if not any(x.status == "REVIEW_NEEDED" for x in result_rows) else "PARTIAL"
+            self.store.update_batch_counts(batch_id, status=batch_status, attempted=batch_attempted, successful=batch_success, failed=batch_failed)
+            self.store.requeue_batch_pending(batch_id)
+            self.store.add_event("batch_completed", run_id=run_id, batch_id=batch_id, status=batch_status, metadata={"batch_number": batch_number, "scheduled_at_utc": rows[0]["scheduled_at_utc"], "planned": len(rows), "attempted": batch_attempted, "successful": batch_success, "failed": batch_failed, "duration_seconds": round(time.monotonic()-start,2), "senders": [r["sender_id"] for r in rows]})
+            self._arm_batch_gap()
+        return {"batches": batches, "attempted": attempted, "failed": failed, "successful": successful, "successful_in_run": max(0, successful - initial_success_total_at_start)}
 
-    def __init__(self, llm: LLMClient, confidence_threshold: float):
-        self.llm = llm
-        self.confidence_threshold = confidence_threshold
+    def sync_mailboxes(self, run_id: str, dry_run: bool) -> dict[str, int]:
+        if dry_run:
+            print("MAILBOX_MODE=SKIPPED_DRY_RUN")
+            return {"mailbox_checks": 0, "inbound_processed": 0, "replies": 0, "bounces": 0, "unsubscribes": 0}
+        from app.mailbox import MailboxMonitor
+        monitor = MailboxMonitor(self.store, self.settings, run_id)
+        return monitor.run_all()
 
-    def _build_prompt(self, lead, research: dict, history: list[dict], sequence: str, sender_signature: str) -> str:
-        research_map = dict(research) if not isinstance(research, dict) else research
-        evidence = "\n".join(
-            f"URL: {x['url']}\nTEXT: {x.get('snippet', '')}" for x in json_items(research_map.get("evidence_json", "[]"))
-        )[:14000]
-        prior = "\n\n".join(
-            f"{x['sequence_type']}: {x['subject']}\n{str(x.get('body') or '')[:1500]}" for x in history[-5:]
-        ) or "(none)"
-        return (
-            f"CURRENT LEAD ONLY\nLeadID: {lead['lead_id']}\nCompany: {lead['company']}\nEmail: {lead['email']}\nWebsite: {lead['website']}\n"
-            f"Location: {lead['city']}, {lead['region']} {lead['country_code']}\nTimezone: {lead['timezone']}\n\n"
-            f"CURRENT RESEARCH ONLY\nSummary: {research_map.get('business_summary', '')}\nServices: {research_map.get('services_json', '')}\n"
-            f"Business facts: {research_map.get('business_facts_json', '')}\nCustomer journey: {research_map.get('customer_journey_signals_json', '')}\n"
-            f"AI opportunity signals: {research_map.get('ai_opportunity_signals_json', '')}\nImportant public text: {research_map.get('important_public_text', '')}\n"
-            f"Evidence:\n{evidence}\n\n"
-            f"CURRENT OUTREACH HISTORY ONLY\n{prior}\n\nSequence: {sequence}\nSender signature: {sender_signature}\nReturn JSON only."
-        )
+    def prepare_and_send_followups(self, run_id: str, allow_real_send: bool, dry_run: bool) -> dict[str, int]:
+        generated = 0
+        from app.personalization import PersonalizationValidator
+        for sequence in ("FOLLOWUP_1", "FOLLOWUP_2", "FOLLOWUP_3"):
+            number = int(sequence.split("_")[-1])
+            delay = {1: timedelta(hours=self.settings.followup_1_delay_hours), 2: timedelta(days=self.settings.followup_2_delay_days), 3: timedelta(days=self.settings.followup_3_delay_days)}[number]
+            for previous in self.store.list_followup_candidates(sequence, 100):
+                lead = self.store.get_lead(previous["lead_id"])
+                if not lead or lead["status"] in TERMINAL_LEAD_STATES or self.store.is_suppressed(lead["email"]):
+                    continue
+                due_at = parse_utc(previous["sent_at_utc"]) + delay
+                if due_at > datetime.now(timezone.utc):
+                    continue
+                research = self.store.latest_research(previous["lead_id"])
+                if not research or research["research_status"] != "RESEARCHED":
+                    continue
+                history = self.store.previous_sent_history(previous["lead_id"])
+                sender = next(s for s in self.settings.sender_configs() if s.sender_id == previous["sender_id"])
+                try:
+                    draft = self.personalization.followup(dict(lead), dict(research), history, sequence, sender.email)
+                    validation = PersonalizationValidator(self.settings.min_personalization_confidence).validate(
+                        dict(lead), dict(research), draft, [x["body"] for x in history], self.store
+                    )
+                    for retry_index in range(1, getattr(self.settings, "personalization_retry_limit", 0) + 1):
+                        if validation.ok or not validation.retryable:
+                            break
+                        self.store.add_event(
+                            "followup_personalization_retry",
+                            run_id=run_id,
+                            lead_id=lead["lead_id"],
+                            sender_id=sender.sender_id,
+                            sequence_type=sequence,
+                            status="RETRYING",
+                            reason=validation.reason,
+                            metadata={"attempt": retry_index, "limit": self.settings.personalization_retry_limit},
+                        )
+                        try:
+                            draft = self.personalization.repair_followup(
+                                dict(lead), dict(research), history, sequence, draft, validation.reason, sender.email
+                            )
+                            validation = PersonalizationValidator(self.settings.min_personalization_confidence).validate(
+                                dict(lead), dict(research), draft, [x["body"] for x in history], self.store
+                            )
+                        except Exception as exc:
+                            self.store.add_event(
+                                "followup_repair_failed",
+                                run_id=run_id,
+                                lead_id=lead["lead_id"],
+                                sender_id=sender.sender_id,
+                                sequence_type=sequence,
+                                status="FAILED_RETRYABLE",
+                                reason=exc.__class__.__name__,
+                            )
+                            validation = None
+                            break
+                    if validation is None:
+                        continue
+                    if not validation.ok:
+                        self.store.add_event("followup_rejected", run_id=run_id, lead_id=lead["lead_id"], sender_id=sender.sender_id, sequence_type=sequence, status="FAILED_TERMINAL", reason=validation.reason)
+                        continue
+                except Exception as exc:
+                    self.store.add_event("followup_generation_failed", run_id=run_id, lead_id=lead["lead_id"], sender_id=sender.sender_id, sequence_type=sequence, status="FAILED_RETRYABLE", reason=exc.__class__.__name__)
+                    continue
+                oid = self.store.insert_followup(run_id=run_id, lead_id=lead["lead_id"], sequence_type=sequence, sequence_number=number, sender_id=sender.sender_id, sender_email=sender.email, subject=draft.subject, body=draft.body, evidence_urls=draft.evidence_urls, confidence=draft.confidence, in_reply_to=previous["message_id"], references_text=previous["message_id"], scheduled_at_utc=iso(due_at))
+                if oid:
+                    generated += 1
+                    self.store.add_event("followup_generated", run_id=run_id, lead_id=lead["lead_id"], outreach_id=oid, sender_id=sender.sender_id, sequence_type=sequence, status="QUEUED", metadata={"scheduled_at_utc": iso(due_at)})
+        if not allow_real_send:
+            return {"generated": generated, "sent": 0, "batches": 0}
+        sent = 0
+        batches = 0
+        for batch_number in range(1, self.settings.max_batches_per_run + 1):
+            rows = self.store.list_due_followups(min(self.settings.batch_size, self.settings.daily_followup_limit))
+            if not rows:
+                break
+            self._wait_for_next_batch()
+            selected = []
+            used_senders = set()
+            now = datetime.now(timezone.utc)
+            available_sender_ids = {s.sender_id for s in self._available_senders(now, True)}
+            for row in rows:
+                if row["sender_id"] in used_senders or row["sender_id"] not in available_sender_ids:
+                    continue
+                if row["lead_status"] in TERMINAL_LEAD_STATES:
+                    continue
+                if self.settings.enforce_send_window and not self._within_window(now, row["timezone"]):
+                    continue
+                selected.append(row); used_senders.add(row["sender_id"])
+                if len(selected) >= self.settings.batch_size:
+                    break
+            if not selected:
+                break
+            scheduled = now
+            batch_id = self.store.create_batch(run_id, batch_number, "FOLLOWUP", iso(scheduled), len(selected))
+            self.store.assign_batch(batch_id, [(r["outreach_id"], r["lead_id"], r["sender_id"], r["sender_email"]) for r in selected], iso(scheduled))
+            result_rows = self.mailer.send_batch(batch_id, [dict(r) for r in self.store.fetchall("SELECT o.*,l.timezone,l.status AS lead_status FROM outreach o JOIN leads l ON l.lead_id=o.lead_id WHERE o.batch_id=?", [batch_id])], {s.sender_id: s for s in self.settings.sender_configs()}, allow_real_send)
+            success = sum(1 for r in result_rows if r.status == "SENT")
+            failed = sum(1 for r in result_rows if r.status.startswith("FAILED"))
+            attempted = sum(1 for r in result_rows if r.status != "DRY_RUN")
+            self.store.update_batch_counts(batch_id, status="COMPLETED", attempted=attempted, successful=success, failed=failed)
+            self.store.requeue_batch_pending(batch_id)
+            sent += success; batches += 1
+            self._arm_batch_gap()
+        return {"generated": generated, "sent": sent, "batches": batches}
 
-    def _build_repair_prompt(
-        self,
-        lead,
-        research: dict,
-        history: list[dict],
-        sequence: str,
-        sender_signature: str,
-        draft: PersonalizationDraft,
-        validation_reason: str,
-    ) -> str:
-        payload = {
-            "eligible": draft.eligible,
-            "personalization_summary": draft.personalization_summary,
-            "observations": draft.observations,
-            "opportunity": draft.opportunity,
-            "personalization_anchors": draft.personalization_anchors,
-            "subject": draft.subject,
-            "body": draft.body,
-            "cta": draft.cta,
-            "signature": draft.signature,
-            "confidence": draft.confidence,
-            "evidence_urls": draft.evidence_urls,
-            "risk_flags": draft.risk_flags,
+    def build_metrics(self, run_id: str, discovery: dict, prep: dict, initial: dict, mailbox: dict, followup: dict, runtime: float) -> dict:
+        return {
+            "run_id": run_id,
+            "runtime_seconds": round(runtime, 2),
+            "discovered": discovery.get("discovered", 0),
+            "verified": discovery.get("verified", 0),
+            "eligible": self.store.count_eligible_untouched() + self.store.scalar("SELECT count(*) FROM leads WHERE status IN ('RESEARCHED','QUEUED','ACTIVE')"),
+            "selected": prep.get("prepared", 0),
+            "researched": prep.get("researched", 0),
+            "personalized": prep.get("personalized", 0),
+            "validated": prep.get("validated", 0),
+            "personalization_retries": prep.get("personalization_retries", 0),
+            "queued": self.store.scalar("SELECT count(*) FROM outreach WHERE workflow_run_id=? AND status IN ('QUEUED','SCHEDULED','SENDING','SENT')", [run_id]),
+            "scheduled": self.store.scalar("SELECT count(*) FROM outreach WHERE workflow_run_id=? AND status='SCHEDULED'", [run_id]),
+            "attempted": initial.get("attempted", 0),
+            "successful_initial_sends": self.store.count_successful_initials(),
+            "successful_initial_sends_in_run": initial.get("successful_in_run", 0),
+            "retryable_failures": self.store.scalar("SELECT count(*) FROM outreach WHERE workflow_run_id=? AND status='FAILED_RETRYABLE'", [run_id]),
+            "terminal_failures": self.store.scalar("SELECT count(*) FROM outreach WHERE workflow_run_id=? AND status='FAILED_TERMINAL'", [run_id]),
+            "suppressed": self.store.scalar("SELECT count(*) FROM suppression"),
+            "replies": mailbox.get("replies", 0),
+            "bounces": mailbox.get("bounces", 0),
+            "unsubscribes": mailbox.get("unsubscribes", 0),
+            "followups_generated": followup.get("generated", 0),
+            "followups_sent": self.store.scalar("SELECT count(*) FROM outreach WHERE workflow_run_id=? AND sequence_type LIKE 'FOLLOWUP_%%' AND status='SENT'", [run_id]),
+            "eligible_untouched_after_run": self.store.count_eligible_untouched(),
+            "batch_count": initial.get("batches", 0),
+            "discovery_runs": discovery.get("runs", 0),
+            "discovery_skipped": discovery.get("skipped", 0),
+            "discovery_skip_reason": discovery.get("skip_reason"),
         }
-        return (
-            self._build_prompt(lead, research, history, sequence, sender_signature)
-            + f"\n\nPREVIOUS DRAFT JSON\n{json.dumps(payload, ensure_ascii=False)}"
-            + f"\n\nVALIDATOR PROBLEMS TO REPAIR\n{validation_reason}\nReturn a corrected JSON draft only."
-        )
 
     @staticmethod
-    def _draft(obj: dict) -> PersonalizationDraft:
-        try:
-            confidence = max(0.0, min(1.0, float(obj.get("confidence") or 0)))
-        except (TypeError, ValueError):
-            confidence = 0.0
-
-        subject = str(obj.get("subject") or "").strip()
-        raw_body = str(obj.get("body") or "").strip()
-        cta = str(obj.get("cta") or "").strip()
-        signature = str(obj.get("signature") or "").strip()
-        body = raw_body
-        if body and cta and cta not in body:
-            body += "\n\n" + cta
-        if body and signature and signature not in body:
-            body += "\n\n" + signature
-
-        return PersonalizationDraft(
-            eligible=_parse_bool(obj.get("eligible")),
-            personalization_summary=str(obj.get("personalization_summary") or "").strip()[:1000],
-            observations=_string_list(obj.get("observations"), limit=6, item_limit=500),
-            opportunity=str(obj.get("opportunity") or "").strip()[:1000],
-            subject=subject,
-            body=body,
-            cta=cta,
-            signature=signature,
-            confidence=confidence,
-            evidence_urls=_string_list(obj.get("evidence_urls"), limit=None, item_limit=2000),
-            risk_flags=_string_list(obj.get("risk_flags"), limit=10, item_limit=500),
-            personalization_anchors=_string_list(obj.get("personalization_anchors"), limit=3, item_limit=500),
-        )
-
-    def initial(self, lead, research: dict, sender_signature: str) -> PersonalizationDraft:
-        return self._draft(
-            self.llm.chat_json_object(
-                self.SYSTEM_PROMPT,
-                self._build_prompt(lead, research, [], "INITIAL", sender_signature),
-                max_tokens=1400,
-            )
-        )
-
-    def followup(self, lead, research: dict, history: list[dict], sequence: str, sender_signature: str) -> PersonalizationDraft:
-        return self._draft(
-            self.llm.chat_json_object(
-                self.FOLLOWUP_SYSTEM_PROMPT,
-                self._build_prompt(lead, research, history, sequence, sender_signature),
-                max_tokens=1400,
-            )
-        )
-
-    def repair_initial(
-        self,
-        lead,
-        research: dict,
-        draft: PersonalizationDraft,
-        validation_reason: str,
-        sender_signature: str,
-    ) -> PersonalizationDraft:
-        return self._repair(
-            lead,
-            research,
-            [],
-            "INITIAL",
-            sender_signature,
-            draft,
-            validation_reason,
-        )
-
-    def repair_followup(
-        self,
-        lead,
-        research: dict,
-        history: list[dict],
-        sequence: str,
-        draft: PersonalizationDraft,
-        validation_reason: str,
-        sender_signature: str,
-    ) -> PersonalizationDraft:
-        return self._repair(
-            lead,
-            research,
-            history,
-            sequence,
-            sender_signature,
-            draft,
-            validation_reason,
-        )
-
-    def _repair(
-        self,
-        lead,
-        research: dict,
-        history: list[dict],
-        sequence: str,
-        sender_signature: str,
-        draft: PersonalizationDraft,
-        validation_reason: str,
-    ) -> PersonalizationDraft:
-        return self._draft(
-            self.llm.chat_json_object(
-                self.REPAIR_SYSTEM_PROMPT,
-                self._build_repair_prompt(
-                    lead,
-                    research,
-                    history,
-                    sequence,
-                    sender_signature,
-                    draft,
-                    validation_reason,
-                ),
-                max_tokens=1400,
-            )
-        )
+    def target_not_reached_reason(metrics: dict) -> str:
+        if metrics["successful_initial_sends"] == 0 and metrics["eligible_untouched_after_run"] == 0:
+            return "no eligible untouched leads remain"
+        if metrics["eligible_untouched_after_run"] > 0:
+            return "remaining leads are not currently valid/sendable, or batch/sender limits were exhausted"
+        return "some selected messages failed and the bounded batch/retry policy ended before target"
