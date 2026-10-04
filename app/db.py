@@ -148,6 +148,7 @@ class Store:
             else:
                 self.execute("TRUNCATE TABLE " + ", ".join(tables) + " RESTART IDENTITY CASCADE")
 
+    # ---- Workflow runs / events -------------------------------------------------
     def recover_interrupted_workflow_state(self, current_run_id: str) -> None:
         """Recover durable state left by a previously interrupted runner before resuming."""
         stale_runs = self.fetchall(
@@ -158,10 +159,11 @@ class Store:
         if stale_run_ids:
             now = now_utc()
             for run_id in stale_run_ids:
-                self.execute("UPDATE workflow_run SET ended_at_utc=?,status='FAILED',metrics_json=? WHERE workflow_run_id=?", [now, json.dumps({'status':'FAILED','error':'runner_interrupted'}), run_id])
+                self.execute(
+                    "UPDATE workflow_run SET ended_at_utc=?,status='FAILED',metrics_json=? WHERE workflow_run_id=?",
+                    [now, json.dumps({"status": "FAILED", "error": "runner_interrupted"}), run_id],
+                )
             placeholders = ",".join("?" for _ in stale_run_ids)
-            # Rows that were only scheduled belong back in the durable queue. A SENDING row is
-            # intentionally made REVIEW_NEEDED because SMTP delivery may already have happened.
             self.execute(
                 f"UPDATE outreach SET batch_id=NULL,status='QUEUED',updated_at_utc=? WHERE workflow_run_id IN ({placeholders}) AND status='SCHEDULED'",
                 [now, *stale_run_ids],
@@ -170,18 +172,17 @@ class Store:
                 f"UPDATE outreach SET status='REVIEW_NEEDED',last_error='runner_interrupted_while_sending',updated_at_utc=? WHERE workflow_run_id IN ({placeholders}) AND status='SENDING'",
                 [now, *stale_run_ids],
             )
-        # No GitHub runner should still be executing when the next manual run starts. Recover
-        # every leftover research claim to the furthest durable state we actually have.
         self.execute(
             """UPDATE leads AS l
-               SET status=CASE WHEN EXISTS (SELECT 1 FROM lead_research r WHERE r.lead_id=l.lead_id AND r.research_status='RESEARCHED')
-                               THEN 'RESEARCHED' ELSE 'ELIGIBLE' END,
+               SET status=CASE WHEN EXISTS (
+                   SELECT 1 FROM lead_research r
+                   WHERE r.lead_id=l.lead_id AND r.research_status='RESEARCHED'
+               ) THEN 'RESEARCHED' ELSE 'ELIGIBLE' END,
                    updated_at_utc=?
                WHERE l.status='RESEARCHING'""",
             [now_utc()],
         )
 
-    # ---- Workflow runs / events -------------------------------------------------
     def start_workflow(self, mode: str, reset_state: bool) -> str:
         run_id = str(uuid.uuid4())
         ts = now_utc()
@@ -289,6 +290,40 @@ class Store:
                AND NOT EXISTS (SELECT 1 FROM outreach o WHERE o.lead_id=l.lead_id AND o.sequence_type='INITIAL' AND o.sequence_number=1)"""
         ))
 
+    def reopen_personalization_reviews(self, limit: int = 200) -> list[str]:
+        """Reopen only REVIEW_NEEDED leads whose latest event is a personalization rejection."""
+        limit = max(0, int(limit))
+        if limit == 0:
+            return []
+        rows = self.fetchall(
+            """SELECT l.lead_id
+               FROM leads l
+               WHERE l.status='REVIEW_NEEDED'
+                 AND NOT EXISTS (
+                     SELECT 1 FROM outreach o
+                     WHERE o.lead_id=l.lead_id
+                       AND o.sequence_type='INITIAL'
+                       AND o.sequence_number=1
+                 )
+                 AND (
+                     SELECT e.event_type
+                     FROM event_log e
+                     WHERE e.lead_id=l.lead_id
+                     ORDER BY e.event_timestamp_utc DESC
+                     LIMIT 1
+                 )='personalization_rejected'
+               ORDER BY l.updated_at_utc,l.lead_id
+               LIMIT ?""",
+            [limit],
+        )
+        lead_ids = [str(row['lead_id']) for row in rows]
+        for lead_id in lead_ids:
+            self.execute(
+                "UPDATE leads SET status='RESEARCHED',updated_at_utc=? WHERE lead_id=? AND status='REVIEW_NEEDED'",
+                [now_utc(), lead_id],
+            )
+        return lead_ids
+
     # ---- Research ---------------------------------------------------------------
     def save_research(self, record: dict[str, Any]) -> None:
         self.execute(
@@ -352,7 +387,8 @@ class Store:
     def next_batch_number(self, run_id: str, batch_type: str) -> int:
         return int(self.scalar(
             "SELECT COALESCE(MAX(batch_number),0)+1 FROM outreach_batches WHERE workflow_run_id=? AND batch_type=?",
-            [run_id, batch_type], default=1,
+            [run_id, batch_type],
+            default=1,
         ))
 
     def body_hash_exists(self, body_hash: str) -> bool:
