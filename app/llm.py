@@ -56,7 +56,7 @@ class LLMClient:
             method="POST",
         )
         last: Exception | None = None
-        for attempt in range(3):
+        for attempt in range(1):
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                     body = response.read().decode("utf-8")
