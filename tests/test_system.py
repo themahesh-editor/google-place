@@ -43,6 +43,8 @@ class TestSettings:
         self.daily_initial_limit = 10
         self.daily_followup_limit = 10
         self.daily_total_limit = 40
+        self.enforce_send_window = False
+        self.enforce_daily_limits = False
         self.max_concurrent_sends = 10
         self.retry_limit = 3
         self.retry_base_seconds = 1
@@ -85,7 +87,6 @@ def lead_row(i=1, status="ELIGIBLE"):
 
 
 def research_row(store, lead):
-    import json
     rid = f"research-{lead['lead_id']}"
     store.save_research({
         "research_id": rid, "lead_id": lead["lead_id"], "website_domain": lead["website_domain"], "canonical_url": lead["website"],
@@ -209,7 +210,6 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(self.store.scalar("SELECT count(*) FROM outreach WHERE status='SENT' AND message_id IS NOT NULL"), 5)
 
     def test_stopped_sender_is_not_selected(self):
-        from app.orchestrator import Orchestrator
         day = datetime.now(self.settings.timezone()).date().isoformat()
         self.store.set_sender_health("SENDER_1", day, "STOPPED")
         orch = Orchestrator(self.settings, self.store, object(), object(), object(), object())
@@ -232,7 +232,6 @@ class SystemTests(unittest.TestCase):
         self.assertEqual(self.store.sender_day(sender.sender_id, day)["health_state"], "HEALTHY")
 
     def test_dry_run_does_not_mutate_message_state(self):
-        from app.mailer import BatchSendController
         run = self.store.start_workflow("MANUAL", False)
         lead = lead_row(1); self.store.upsert_lead(lead)
         sender = self.settings.sender_configs()[0]
@@ -244,7 +243,6 @@ class SystemTests(unittest.TestCase):
         result = controller.send_batch(batch, [dict(self.store.fetchone("SELECT * FROM outreach WHERE outreach_id=?", [row["outreach_id"]]))], {sender.sender_id: sender}, False)
         self.assertEqual(result[0].status, "DRY_RUN")
         self.assertEqual(self.store.get_outreach(row["outreach_id"])["status"], "SCHEDULED")
-
 
     def test_interrupted_research_and_batches_are_recovered_on_next_run(self):
         old_run = self.store.start_workflow("MANUAL", False)
@@ -324,17 +322,15 @@ class SystemTests(unittest.TestCase):
         self.assertFalse(v.ok); self.assertIn("low_confidence", v.reason)
 
     def test_followup_chain_requires_previous_success(self):
-        from app.personalization import PersonalizationGenerator
         run = self.store.start_workflow("MANUAL", False)
         lead = lead_row(1); self.store.upsert_lead(lead); research_row(self.store, lead)
         initial_id = deterministic_outreach_id(lead["lead_id"], "INITIAL", 1)
         body = "Company 1 initial message"
         self.store.insert_outreach({"outreach_id":initial_id,"workflow_run_id":run,"lead_id":lead["lead_id"],"sequence_type":"INITIAL","sequence_number":1,"sender_id":"SENDER_1","sender_email":"sender1@example.com","email":lead["email"],"subject":"s","body":body,"status":"SENT","sent_at_utc":"2026-09-01T12:00:00Z","message_id":"<m1@example.com>","evidence_urls":[lead["website"]],"personalization_confidence":.9,"body_hash":"h1"})
-        # No F1 has been inserted until due; this call will create only F1.
         class FakePersonalization:
             def followup(self,*args,**kwargs): return PersonalizationDraft(True,"",[],"","F1","Company 1 follows up.","","",.95,[lead["website"]],[])
         orch = Orchestrator(self.settings,self.store,object(),object(),FakePersonalization(),BatchSendController(self.store,self.settings))
-        old_wait = orch._wait_until; orch._wait_until=lambda x: None
+        orch._wait_until=lambda x: None
         orch.prepare_and_send_followups(run, False, True)
         self.assertIsNotNone(self.store.get_sequence(lead["lead_id"],"FOLLOWUP_1",1))
         self.assertIsNone(self.store.get_sequence(lead["lead_id"],"FOLLOWUP_2",2))
@@ -370,7 +366,7 @@ class SystemTests(unittest.TestCase):
     def test_followup_f2_and_f3_wait_for_successful_previous_stage(self):
         run_id = self.store.start_workflow("MANUAL", False)
         lead = lead_row(1); self.store.upsert_lead(lead); research_row(self.store, lead)
-        initial = self.store.insert_outreach({"outreach_id":deterministic_outreach_id(lead["lead_id"],"INITIAL",1),"workflow_run_id":run_id,"lead_id":lead["lead_id"],"sequence_type":"INITIAL","sequence_number":1,"sender_id":"SENDER_1","sender_email":"sender1@example.com","email":lead["email"],"subject":"s","body":"Company 1 initial","status":"SENT","sent_at_utc":"2026-09-01T12:00:00Z","message_id":"<m1@example.com>","evidence_urls":[lead["website"]],"personalization_confidence":.9,"body_hash":"h1"})
+        self.store.insert_outreach({"outreach_id":deterministic_outreach_id(lead["lead_id"],"INITIAL",1),"workflow_run_id":run_id,"lead_id":lead["lead_id"],"sequence_type":"INITIAL","sequence_number":1,"sender_id":"SENDER_1","sender_email":"sender1@example.com","email":lead["email"],"subject":"s","body":"Company 1 initial","status":"SENT","sent_at_utc":"2026-09-01T12:00:00Z","message_id":"<m1@example.com>","evidence_urls":[lead["website"]],"personalization_confidence":.9,"body_hash":"h1"})
         class FakePersonalization:
             def followup(self, lead, research, history, sequence, sender):
                 return PersonalizationDraft(True,"",[],"",sequence,f"Company 1 {sequence} follow-up","","",.95,[lead["website"]],[])
@@ -390,7 +386,6 @@ class SystemTests(unittest.TestCase):
     def test_reset_false_preserves_state(self):
         lead = lead_row(1); self.store.upsert_lead(lead)
         self.assertEqual(self.store.scalar("SELECT count(*) FROM leads"), 1)
-        # Normal runs do not call reset_runtime_state.
         self.assertEqual(self.store.get_lead(lead["lead_id"])["email"], lead["email"])
 
     def test_mailbox_reply_suppresses_followups(self):
@@ -406,10 +401,34 @@ class SystemTests(unittest.TestCase):
             def fetch_since(self, last_uid, lookback_minutes, max_messages): return [(1,msg.as_bytes())]
             def close(self): pass
         monitor = MailboxMonitor(self.store,self.settings,run,FakeMailbox)
-        # save existing mailbox state so the fake cursor can be checked too
         result = monitor.run_sender(self.settings.sender_configs()[0])
         self.assertEqual(result["replies"],1)
         self.assertEqual(self.store.get_lead(lead["lead_id"])["status"],"REPLIED")
+
+    def test_manual_test_mode_ignores_send_window_and_daily_limits(self):
+        orch = Orchestrator(self.settings, self.store, object(), object(), object(), object())
+        now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+        self.assertEqual(orch._next_batch_slot(now, "America/New_York"), now)
+        day = now.astimezone(self.settings.timezone()).date().isoformat()
+        for sender in self.settings.sender_configs():
+            self.store.sender_day(sender.sender_id, day)
+            self.store.execute("UPDATE sender_daily_state SET initials=100, followups=100, total=100 WHERE sender_id=? AND date_key=?", [sender.sender_id, day])
+        available = orch._available_senders(now, False)
+        self.assertEqual(len(available), 10)
+
+    def test_batch_gap_is_ten_minutes_when_enabled_by_configuration(self):
+        orch = Orchestrator(self.settings, self.store, object(), object(), object(), object())
+        self.settings.batch_interval_minutes = 10
+        waits = []
+        orch._wait_until = lambda when: waits.append(when)
+        before = datetime.now(timezone.utc)
+        orch._arm_batch_gap()
+        armed = orch.next_batch_allowed_at
+        self.assertIsNotNone(armed)
+        self.assertGreaterEqual((armed - before).total_seconds(), 599)
+        orch._wait_for_next_batch()
+        self.assertEqual(len(waits), 1)
+        self.assertIsNone(orch.next_batch_allowed_at)
 
 
 if __name__ == "__main__":
