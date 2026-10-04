@@ -94,7 +94,8 @@ class Settings:
     reset_state: bool
     enforce_send_window: bool
     enforce_daily_limits: bool
-
+    personalization_retry_limit: int
+    
     @classmethod
     def from_env(cls) -> "Settings":
         tz = _env("APP_TIMEZONE", "Asia/Kolkata")
@@ -143,6 +144,7 @@ class Settings:
             daily_total_limit=_int("DAILY_TOTAL_LIMIT", 40),
             enforce_send_window=_bool("ENFORCE_SEND_WINDOW", True),
             enforce_daily_limits=_bool("ENFORCE_DAILY_LIMITS", True),
+            personalization_retry_limit=_int("PERSONALIZATION_RETRY_LIMIT", 1),
             max_concurrent_sends=_int("MAX_CONCURRENT_SENDS", 10),
             retry_limit=_int("RETRY_LIMIT", 3),
             retry_base_seconds=_int("RETRY_BASE_SECONDS", 60),
@@ -191,6 +193,8 @@ class Settings:
     def validate(self) -> None:
         if not self.supabase_db_url.startswith(("postgresql://", "postgres://")):
             raise ValueError("SUPABASE_DB_URL must be a PostgreSQL connection string")
+        if self.personalization_retry_limit < 0:
+            raise ValueError("PERSONALIZATION_RETRY_LIMIT cannot be negative")
         if len(self.allowed_country_codes) == 0:
             raise ValueError("ALLOWED_COUNTRY_CODES cannot be empty")
         if self.batch_size != 10:
