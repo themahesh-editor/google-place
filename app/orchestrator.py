@@ -199,7 +199,7 @@ class Orchestrator:
             self.store.count_initial_progress() + self.settings.batch_size,
         )
         
-        max_rounds = max(1, self.settings.batch_size * 5)
+        max_rounds = 5
         
         for _ in range(max_rounds):
             if self.store.count_successful_initials() >= target:
@@ -241,13 +241,28 @@ class Orchestrator:
                     continue
                 researched += 1
                 sender_signature = "Best,\nAttachAI"
+                personalization_started = time.monotonic()
+                print(
+                    f"PERSONALIZATION_START lead_id={lead_dict['lead_id']} "
+                    f"progress={self.store.count_initial_progress()}/{prepare_goal}"
+                )
+                
                 try:
-                    print(
-                        f"PERSONALIZATION_START lead_id={lead_dict['lead_id']} "
-                        f"progress={self.store.count_initial_progress()}/{prepare_goal}"
+                    draft = self.personalization.initial(
+                        lead_dict,
+                        record,
+                        sender_signature,
                     )
-                    draft = self.personalization.initial(lead_dict, record, sender_signature)
+                    print(
+                        f"PERSONALIZATION_END lead_id={lead_dict['lead_id']} "
+                        f"elapsed_seconds={round(time.monotonic() - personalization_started, 2)}"
+                    )
                 except Exception as exc:
+                    print(
+                        f"PERSONALIZATION_ERROR lead_id={lead_dict['lead_id']} "
+                        f"elapsed_seconds={round(time.monotonic() - personalization_started, 2)} "
+                        f"error={exc.__class__.__name__}: {exc}"
+                    )
                     blocked_this_run.add(lead_dict["lead_id"])
                     self.store.update_lead_status(lead_dict["lead_id"], "ELIGIBLE")
                     self.store.add_event("personalization_failed", run_id=run_id, lead_id=lead_dict["lead_id"], status="FAILED_RETRYABLE", reason=exc.__class__.__name__)
