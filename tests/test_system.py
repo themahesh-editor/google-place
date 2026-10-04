@@ -65,6 +65,8 @@ class TestSettings:
         self.send_enabled = False
         self.dry_run = True
         self.reset_state = False
+        self.personalization_retry_limit = 1
+        self.reopen_personalization_reviews = False
 
     def timezone(self):
         from zoneinfo import ZoneInfo
@@ -112,7 +114,7 @@ class FakeSMTP:
 
 class FakeLLM:
     def initial(self):
-        return PersonalizationDraft(True, "summary", ["observation"], "help", "About Company", "Company provides a service. AttachAI could answer common questions before a booking.", "Would a quick look be useful?", "Best, AttachAI", .95, ["https://company1.example/"], [])
+        return PersonalizationDraft(True, "summary", ["observation"], "help", "About Company", "The booking page could be supported with common answers before visitors request a booking.", "Would a quick look be useful?", "Best, AttachAI", .95, ["https://company1.example/"], [], ["booking page"])
 
 
 class SystemTests(unittest.TestCase):
@@ -272,7 +274,7 @@ class SystemTests(unittest.TestCase):
                 raise AssertionError("existing researched lead was crawled/researched again")
         class GoodPersonalization:
             def initial(self, lead, research, sender_signature):
-                return PersonalizationDraft(True, "summary", ["observation"], "help", "Subject", "Company 1 factual message.", "", "", .95, [lead["website"]], [])
+                return PersonalizationDraft(True, "summary", ["observation"], "help", "Subject", "The booking page could answer common visitor questions.", "", "", .95, [lead["website"]], [], ["booking page"])
         orch = Orchestrator(self.settings, self.store, object(), ShouldNotResearch(), GoodPersonalization(), object())
         result = orch.prepare_initial_messages(run, 1)
         self.assertEqual(result["prepared"], 1)
@@ -286,7 +288,7 @@ class SystemTests(unittest.TestCase):
             research_row(self.store, lead)
         class GoodPersonalization:
             def initial(self, lead, research, sender_signature):
-                return PersonalizationDraft(True, "summary", ["observation"], "help", f"Subject {lead['lead_id'][:4]}", f"{lead['company']} factual message.", "", "", .95, [lead["website"]], [])
+                return PersonalizationDraft(True, "summary", ["observation"], "help", f"Subject {lead['lead_id'][:4]}", f"The booking page for {lead['company']} could answer common visitor questions.", "", "", .95, [lead["website"]], [], ["booking page"])
         class ForbiddenDiscovery:
             def __init__(self): self.calls = 0
             def run(self, *args, **kwargs):
@@ -308,7 +310,7 @@ class SystemTests(unittest.TestCase):
         research_row(self.store, lead)
         class BadPersonalization:
             def initial(self, lead, research, sender_signature):
-                return PersonalizationDraft(False, "", [], "", "", "", "", "", .10, [], [])
+                return PersonalizationDraft(False, "", [], "", "", "", "", "", .10, [], [], [])
         orch = Orchestrator(self.settings, self.store, object(), object(), BadPersonalization(), object())
         result = orch.prepare_initial_messages(run, 1)
         self.assertEqual(result["prepared"], 0)
@@ -317,7 +319,7 @@ class SystemTests(unittest.TestCase):
 
     def test_validator_enforces_configured_threshold(self):
         lead = lead_row(1); self.store.upsert_lead(lead); research = research_row(self.store, lead)
-        draft = PersonalizationDraft(True, "", [], "", "Subject", "Company 1 factual message.", "", "", .70, [lead["website"]], [])
+        draft = PersonalizationDraft(True, "", [], "", "Subject", "The booking page could answer common visitor questions.", "", "", .70, [lead["website"]], [], ["booking page"])
         v = PersonalizationValidator(.75).validate(lead, research, draft, [], self.store)
         self.assertFalse(v.ok); self.assertIn("low_confidence", v.reason)
 
@@ -328,7 +330,7 @@ class SystemTests(unittest.TestCase):
         body = "Company 1 initial message"
         self.store.insert_outreach({"outreach_id":initial_id,"workflow_run_id":run,"lead_id":lead["lead_id"],"sequence_type":"INITIAL","sequence_number":1,"sender_id":"SENDER_1","sender_email":"sender1@example.com","email":lead["email"],"subject":"s","body":body,"status":"SENT","sent_at_utc":"2026-09-01T12:00:00Z","message_id":"<m1@example.com>","evidence_urls":[lead["website"]],"personalization_confidence":.9,"body_hash":"h1"})
         class FakePersonalization:
-            def followup(self,*args,**kwargs): return PersonalizationDraft(True,"",[],"","F1","Company 1 follows up.","","",.95,[lead["website"]],[])
+            def followup(self,*args,**kwargs): return PersonalizationDraft(True,"",[],"","F1","The booking page could answer common visitor questions.","","",.95,[lead["website"]],[],["booking page"])
         orch = Orchestrator(self.settings,self.store,object(),object(),FakePersonalization(),BatchSendController(self.store,self.settings))
         orch._wait_until=lambda x: None
         orch.prepare_and_send_followups(run, False, True)
@@ -369,7 +371,7 @@ class SystemTests(unittest.TestCase):
         self.store.insert_outreach({"outreach_id":deterministic_outreach_id(lead["lead_id"],"INITIAL",1),"workflow_run_id":run_id,"lead_id":lead["lead_id"],"sequence_type":"INITIAL","sequence_number":1,"sender_id":"SENDER_1","sender_email":"sender1@example.com","email":lead["email"],"subject":"s","body":"Company 1 initial","status":"SENT","sent_at_utc":"2026-09-01T12:00:00Z","message_id":"<m1@example.com>","evidence_urls":[lead["website"]],"personalization_confidence":.9,"body_hash":"h1"})
         class FakePersonalization:
             def followup(self, lead, research, history, sequence, sender):
-                return PersonalizationDraft(True,"",[],"",sequence,f"Company 1 {sequence} follow-up","","",.95,[lead["website"]],[])
+                return PersonalizationDraft(True,"",[],"",sequence,f"The booking page could support a {sequence} follow-up.","","",.95,[lead["website"]],[],["booking page"])
         orch = Orchestrator(self.settings,self.store,object(),object(),FakePersonalization(),BatchSendController(self.store,self.settings))
         orch.prepare_and_send_followups(run_id, False, True)
         f1 = self.store.get_sequence(lead["lead_id"],"FOLLOWUP_1",1)
@@ -429,6 +431,95 @@ class SystemTests(unittest.TestCase):
         orch._wait_for_next_batch()
         self.assertEqual(len(waits), 1)
         self.assertIsNone(orch.next_batch_allowed_at)
+
+    def test_validator_low_confidence_is_retryable(self):
+        lead = lead_row(1); self.store.upsert_lead(lead); research = research_row(self.store, lead)
+        draft = PersonalizationDraft(True, "", [], "", "Subject", "The booking page could answer common visitor questions.", "", "", .70, [lead["website"]], [], ["booking page"])
+        result = PersonalizationValidator(.75).validate(lead, research, draft, [], self.store)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.retryable)
+        self.assertIn("low_confidence", result.reason)
+
+    def test_validator_company_name_is_not_required_when_anchor_is_grounded_and_used(self):
+        lead = lead_row(1); self.store.upsert_lead(lead); research = research_row(self.store, lead)
+        draft = PersonalizationDraft(True, "", [], "", "Subject", "The booking page could answer common visitor questions.", "", "", .95, [lead["website"]], [], ["booking page"])
+        result = PersonalizationValidator(.75).validate(lead, research, draft, [], self.store)
+        self.assertTrue(result.ok, result.reason)
+        self.assertNotIn("company_not_personalized", result.reason)
+
+    def test_validator_anchor_not_used_is_retryable(self):
+        lead = lead_row(1); self.store.upsert_lead(lead); research = research_row(self.store, lead)
+        draft = PersonalizationDraft(True, "", [], "", "Subject", "We help answer common website questions.", "", "", .95, [lead["website"]], [], ["booking page"])
+        result = PersonalizationValidator(.75).validate(lead, research, draft, [], self.store)
+        self.assertFalse(result.ok)
+        self.assertTrue(result.retryable)
+        self.assertIn("personalization_anchor_not_used", result.reason)
+
+    def test_validator_accepts_equivalent_evidence_urls(self):
+        lead = lead_row(1); self.store.upsert_lead(lead); research = research_row(self.store, lead)
+        draft = PersonalizationDraft(True, "", [], "", "Subject", "The booking page could answer common visitor questions.", "", "", .95, ["HTTPS://COMPANY1.EXAMPLE"], [], ["booking page"])
+        result = PersonalizationValidator(.75).validate(lead, research, draft, [], self.store)
+        self.assertTrue(result.ok, result.reason)
+
+    def test_validator_hard_failure_is_not_retryable(self):
+        lead = lead_row(1); self.store.upsert_lead(lead); research = research_row(self.store, lead)
+        draft = PersonalizationDraft(True, "", [], "", "", "The booking page could answer common visitor questions.", "", "", .70, [lead["website"]], [], ["booking page"])
+        result = PersonalizationValidator(.75).validate(lead, research, draft, [], self.store)
+        self.assertFalse(result.ok)
+        self.assertFalse(result.retryable)
+        self.assertIn("empty_subject", result.reason)
+        self.assertIn("low_confidence", result.reason)
+
+    def test_initial_validation_failure_is_repaired_once_and_queued(self):
+        run = self.store.start_workflow("MANUAL", False)
+        lead = lead_row(1); self.store.upsert_lead(lead); research_row(self.store, lead)
+
+        class RepairingPersonalization:
+            def __init__(self): self.repair_calls = 0
+            def initial(self, lead, research, sender_signature):
+                return PersonalizationDraft(True, "", [], "", "Subject", "The booking page could answer common visitor questions.", "", "", .50, [lead["website"]], [], ["booking page"])
+            def repair_initial(self, lead, research, draft, reason, sender_signature):
+                self.repair_calls += 1
+                return PersonalizationDraft(True, "", [], "", "Subject", "The booking page could answer common visitor questions.", "", "", .95, [lead["website"]], [], ["booking page"])
+
+        personalization = RepairingPersonalization()
+        orch = Orchestrator(self.settings, self.store, object(), object(), personalization, object())
+        result = orch.prepare_initial_messages(run, 1)
+        self.assertEqual(result["prepared"], 1)
+        self.assertEqual(result["personalization_retries"], 1)
+        self.assertEqual(personalization.repair_calls, 1)
+        self.assertEqual(self.store.count_event(run, "personalization_retry"), 1)
+
+    def test_failed_repair_becomes_review_needed_after_bound(self):
+        run = self.store.start_workflow("MANUAL", False)
+        lead = lead_row(1); self.store.upsert_lead(lead); research_row(self.store, lead)
+
+        class BrokenRepairPersonalization:
+            def initial(self, lead, research, sender_signature):
+                return PersonalizationDraft(True, "", [], "", "Subject", "The booking page could answer common visitor questions.", "", "", .50, [lead["website"]], [], ["booking page"])
+            def repair_initial(self, lead, research, draft, reason, sender_signature):
+                return PersonalizationDraft(True, "", [], "", "Subject", "The booking page could answer common visitor questions.", "", "", .50, [lead["website"]], [], ["booking page"])
+
+        orch = Orchestrator(self.settings, self.store, object(), object(), BrokenRepairPersonalization(), object())
+        result = orch.prepare_initial_messages(run, 1)
+        self.assertEqual(result["prepared"], 0)
+        self.assertEqual(result["personalization_retries"], 1)
+        self.assertEqual(self.store.get_lead(lead["lead_id"])["status"], "REVIEW_NEEDED")
+        self.assertEqual(self.store.count_event(run, "personalization_rejected"), 1)
+
+    def test_reopen_personalization_reviews_reopens_only_latest_rejection(self):
+        run = self.store.start_workflow("MANUAL", False)
+        lead1 = lead_row(1); lead2 = lead_row(2)
+        self.store.upsert_lead({**lead1, "status": "REVIEW_NEEDED"})
+        self.store.upsert_lead({**lead2, "status": "REVIEW_NEEDED"})
+        self.store.add_event("personalization_rejected", run_id=run, lead_id=lead1["lead_id"], status="FAILED_TERMINAL", reason="weak_personalization")
+        self.store.add_event("personalization_rejected", run_id=run, lead_id=lead2["lead_id"], status="FAILED_TERMINAL", reason="weak_personalization")
+        self.store.add_event("personalization_review_reopened", run_id=run, lead_id=lead2["lead_id"], status="REOPENED")
+        reopened = self.store.reopen_personalization_reviews(50)
+        self.assertEqual(reopened, [lead1["lead_id"]])
+        self.assertEqual(self.store.get_lead(lead1["lead_id"])["status"], "RESEARCHED")
+        self.assertEqual(self.store.get_lead(lead2["lead_id"])["status"], "REVIEW_NEEDED")
+
 
 
 if __name__ == "__main__":
