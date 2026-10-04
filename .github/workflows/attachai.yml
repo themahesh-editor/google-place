@@ -101,7 +101,7 @@ jobs:
       MAX_BATCHES_PER_RUN: ${{ vars.MAX_BATCHES_PER_RUN || '30' }}
       NVIDIA_BASE_URL: ${{ vars.NVIDIA_BASE_URL || 'https://integrate.api.nvidia.com/v1' }}
       NVIDIA_MODEL: ${{ vars.NVIDIA_MODEL || 'nvidia/nemotron-3-ultra-550b-a55b' }}
-      NVIDIA_TIMEOUT_SECONDS: ${{ vars.NVIDIA_TIMEOUT_SECONDS || '90' }}
+      NVIDIA_TIMEOUT_SECONDS: ${{ vars.NVIDIA_TIMEOUT_SECONDS || '45' }}
       NVIDIA_MAX_TOKENS: ${{ vars.NVIDIA_MAX_TOKENS || '1400' }}
       MIN_PERSONALIZATION_CONFIDENCE: ${{ vars.MIN_PERSONALIZATION_CONFIDENCE || '0.75' }}
       RESET_STATE: ${{ inputs.reset_state }}
