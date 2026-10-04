@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from app.db import now_utc
+from app.personalization import PersonalizationValidator
 
 
 TERMINAL_LEAD_STATES = {"REPLIED", "BOUNCED", "UNSUBSCRIBED", "COMPLETED", "MANUAL_STOP"}
@@ -31,6 +32,8 @@ class Orchestrator:
         self.stage_starts: dict[str, str] = {}
         self.stage_ends: dict[str, str] = {}
         self.next_batch_allowed_at: datetime | None = None
+        self._blocked_initial_leads: set[str] = set()
+        self._active_run_id: str | None = None
 
     def _stage(self, name: str):
         class Stage:
@@ -51,6 +54,12 @@ class Orchestrator:
     def run(self, reset_state: bool, target: int, send_enabled: bool, dry_run: bool) -> dict:
         start_monotonic = time.monotonic()
         run_id: str | None = None
+        self._blocked_initial_leads.clear()
+        self._active_run_id = None
+        self.stage_times.clear()
+        self.stage_starts.clear()
+        self.stage_ends.clear()
+        self.next_batch_allowed_at = None
         try:
             self.store.migrate("migrations")
             if reset_state:
@@ -59,6 +68,18 @@ class Orchestrator:
             run_id = self.store.start_workflow("MANUAL", reset_state)
             print(f"START_TIME={now_utc()}")
             self.reconcile_stale_state(run_id)
+
+            if getattr(self.settings, "reopen_personalization_reviews", False):
+                reopened = self.store.reopen_personalization_reviews(max(200, target * 2))
+                for lead_id in reopened:
+                    self.store.add_event(
+                        "personalization_review_reopened",
+                        run_id=run_id,
+                        lead_id=lead_id,
+                        status="REOPENED",
+                        reason="manual_reprocessing_requested",
+                    )
+                print(f"PERSONALIZATION_REVIEWS_REOPENED={len(reopened)}")
 
             initial_phase = self.run_initial_phase(run_id, target, send_enabled and not dry_run)
             discovery_metrics = initial_phase["discovery"]
@@ -99,11 +120,11 @@ class Orchestrator:
 
     def run_initial_phase(self, run_id: str, target: int, allow_real_send: bool) -> dict[str, dict]:
         """Resume-first initial outreach pipeline. Discovery is a fallback, never the first step when existing work remains."""
-        prep_total = {"prepared": 0, "researched": 0, "personalized": 0, "validated": 0, "rejected": 0}
+        prep_total = {"prepared": 0, "researched": 0, "personalized": 0, "validated": 0, "rejected": 0, "personalization_retries": 0}
         send_total = {"batches": 0, "attempted": 0, "failed": 0, "successful": self.store.count_successful_initials(), "successful_in_run": 0}
         discovery_total = {"seed": "", "discovered": 0, "verified": 0, "places_search_requests": 0, "rejected": 0, "retryable": 0, "duplicates": 0, "runs": 0, "skipped": 0}
 
-        cycle_limit = max(1, min(self.settings.max_batches_per_run * 4, max(10, target * 2)))
+        cycle_limit = max(1, self.settings.max_batches_per_run)
         for cycle in range(1, cycle_limit + 1):
             successful = self.store.count_successful_initials()
             if successful >= target:
@@ -164,8 +185,11 @@ class Orchestrator:
         self.store.reconcile_stale_batches(cutoff)
 
     def prepare_initial_messages(self, run_id: str, target: int) -> dict[str, int]:
-        prepared = researched = personalized = validated = rejected = 0
-        blocked_this_run: set[str] = set()
+        if self._active_run_id != run_id:
+            self._active_run_id = run_id
+            self._blocked_initial_leads.clear()
+        prepared = researched = personalized = validated = rejected = personalization_retries = 0
+        blocked_this_run = self._blocked_initial_leads
         max_rounds = max(1, target * 2)
         for _ in range(max_rounds):
             if self.store.count_successful_initials() >= target:
@@ -204,13 +228,55 @@ class Orchestrator:
                     continue
                 personalized += 1
                 self.store.add_event("personalization_generated", run_id=run_id, lead_id=lead_dict["lead_id"], status="GENERATED", metadata={"confidence": draft.confidence})
-                from app.personalization import PersonalizationValidator
-                validation = PersonalizationValidator(self.settings.min_personalization_confidence).validate(lead_dict, record, draft, [], self.store)
+                validation = PersonalizationValidator(self.settings.min_personalization_confidence).validate(
+                    lead_dict, record, draft, [], self.store
+                )
+                for retry_index in range(1, getattr(self.settings, "personalization_retry_limit", 0) + 1):
+                    if validation.ok or not validation.retryable:
+                        break
+                    self.store.add_event(
+                        "personalization_retry",
+                        run_id=run_id,
+                        lead_id=lead_dict["lead_id"],
+                        status="RETRYING",
+                        reason=validation.reason,
+                        metadata={"attempt": retry_index, "limit": self.settings.personalization_retry_limit},
+                    )
+                    personalization_retries += 1
+                    try:
+                        draft = self.personalization.repair_initial(
+                            lead_dict, record, draft, validation.reason, sender_signature
+                        )
+                        validation = PersonalizationValidator(self.settings.min_personalization_confidence).validate(
+                            lead_dict, record, draft, [], self.store
+                        )
+                    except Exception as exc:
+                        blocked_this_run.add(lead_dict["lead_id"])
+                        self.store.update_lead_status(lead_dict["lead_id"], "ELIGIBLE")
+                        self.store.add_event(
+                            "personalization_repair_failed",
+                            run_id=run_id,
+                            lead_id=lead_dict["lead_id"],
+                            status="FAILED_RETRYABLE",
+                            reason=exc.__class__.__name__,
+                            metadata={"attempt": retry_index},
+                        )
+                        validation = None
+                        break
+
+                if validation is None:
+                    continue
                 if not validation.ok:
                     blocked_this_run.add(lead_dict["lead_id"])
                     rejected += 1
                     self.store.update_lead_status(lead_dict["lead_id"], "REVIEW_NEEDED")
-                    self.store.add_event("personalization_rejected", run_id=run_id, lead_id=lead_dict["lead_id"], status="FAILED_TERMINAL", reason=validation.reason)
+                    self.store.add_event(
+                        "personalization_rejected",
+                        run_id=run_id,
+                        lead_id=lead_dict["lead_id"],
+                        status="FAILED_TERMINAL",
+                        reason=validation.reason,
+                    )
                     continue
                 validated += 1
                 self.store.add_event("personalization_validated", run_id=run_id, lead_id=lead_dict["lead_id"], status="VALIDATED")
@@ -222,7 +288,14 @@ class Orchestrator:
                     blocked_this_run.add(lead_dict["lead_id"])
                     self.store.update_lead_status(lead_dict["lead_id"], "REVIEW_NEEDED")
                     self.store.add_event("outreach_queue_rejected", run_id=run_id, lead_id=lead_dict["lead_id"], status="FAILED_TERMINAL", reason="duplicate_or_existing_outreach")
-        return {"prepared": prepared, "researched": researched, "personalized": personalized, "validated": validated, "rejected": rejected}
+        return {
+            "prepared": prepared,
+            "researched": researched,
+            "personalized": personalized,
+            "validated": validated,
+            "rejected": rejected,
+            "personalization_retries": personalization_retries,
+        }
 
     def _within_window(self, when_utc: datetime, lead_timezone: str) -> bool:
         if not self.settings.enforce_send_window:
@@ -428,7 +501,43 @@ class Orchestrator:
                 sender = next(s for s in self.settings.sender_configs() if s.sender_id == previous["sender_id"])
                 try:
                     draft = self.personalization.followup(dict(lead), dict(research), history, sequence, sender.email)
-                    validation = PersonalizationValidator(self.settings.min_personalization_confidence).validate(dict(lead), dict(research), draft, [x["body"] for x in history], self.store)
+                    validation = PersonalizationValidator(self.settings.min_personalization_confidence).validate(
+                        dict(lead), dict(research), draft, [x["body"] for x in history], self.store
+                    )
+                    for retry_index in range(1, getattr(self.settings, "personalization_retry_limit", 0) + 1):
+                        if validation.ok or not validation.retryable:
+                            break
+                        self.store.add_event(
+                            "followup_personalization_retry",
+                            run_id=run_id,
+                            lead_id=lead["lead_id"],
+                            sender_id=sender.sender_id,
+                            sequence_type=sequence,
+                            status="RETRYING",
+                            reason=validation.reason,
+                            metadata={"attempt": retry_index, "limit": self.settings.personalization_retry_limit},
+                        )
+                        try:
+                            draft = self.personalization.repair_followup(
+                                dict(lead), dict(research), history, sequence, draft, validation.reason, sender.email
+                            )
+                            validation = PersonalizationValidator(self.settings.min_personalization_confidence).validate(
+                                dict(lead), dict(research), draft, [x["body"] for x in history], self.store
+                            )
+                        except Exception as exc:
+                            self.store.add_event(
+                                "followup_repair_failed",
+                                run_id=run_id,
+                                lead_id=lead["lead_id"],
+                                sender_id=sender.sender_id,
+                                sequence_type=sequence,
+                                status="FAILED_RETRYABLE",
+                                reason=exc.__class__.__name__,
+                            )
+                            validation = None
+                            break
+                    if validation is None:
+                        continue
                     if not validation.ok:
                         self.store.add_event("followup_rejected", run_id=run_id, lead_id=lead["lead_id"], sender_id=sender.sender_id, sequence_type=sequence, status="FAILED_TERMINAL", reason=validation.reason)
                         continue
@@ -488,6 +597,7 @@ class Orchestrator:
             "researched": prep.get("researched", 0),
             "personalized": prep.get("personalized", 0),
             "validated": prep.get("validated", 0),
+            "personalization_retries": prep.get("personalization_retries", 0),
             "queued": self.store.scalar("SELECT count(*) FROM outreach WHERE workflow_run_id=? AND status IN ('QUEUED','SCHEDULED','SENDING','SENT')", [run_id]),
             "scheduled": self.store.scalar("SELECT count(*) FROM outreach WHERE workflow_run_id=? AND status='SCHEDULED'", [run_id]),
             "attempted": initial.get("attempted", 0),
