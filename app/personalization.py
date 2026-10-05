@@ -3,6 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
+
+from app.debug import debug
 from urllib.parse import urlparse
 
 from app.llm import LLMClient
@@ -154,6 +157,18 @@ class PersonalizationValidator:
         previous_bodies: list[str],
         store,
     ) -> ValidationResult:
+
+        debug(
+            "VALIDATION_START",
+            lead_id=lead["lead_id"],
+            confidence=draft.confidence,
+            eligible=draft.eligible,
+            body_chars=len(draft.body),
+            subject_chars=len(draft.subject),
+            evidence_count=len(draft.evidence_urls),
+            anchor_count=len(draft.personalization_anchors),
+        )
+
         reasons: list[str] = []
         normalized = _normalize_text(draft.body)
         body_hash = hashlib.sha256(normalized.encode()).hexdigest()
@@ -239,14 +254,25 @@ class PersonalizationValidator:
             reasons.append("json_leakage")
 
         unique_reasons = list(dict.fromkeys(reasons))
-        retryable = bool(unique_reasons) and all(reason in RETRYABLE_REASONS for reason in unique_reasons)
+        retryable = bool(unique_reasons) and all(
+            reason in RETRYABLE_REASONS
+            for reason in unique_reasons
+        )
+
+        debug(
+            "VALIDATION_END",
+            lead_id=lead["lead_id"],
+            ok=not unique_reasons,
+            retryable=retryable,
+            reason=";".join(unique_reasons) or "none",
+        )
+
         return ValidationResult(
             not unique_reasons,
             ";".join(unique_reasons),
             body_hash,
             retryable=retryable,
         )
-
 
 def json_items(raw: str) -> list[dict]:
     try:
@@ -371,23 +397,106 @@ Keep the email concise and professional.
         )
 
     def initial(self, lead, research: dict, sender_signature: str) -> PersonalizationDraft:
-        return self._draft(
-            self.llm.chat_json_object(
+        started = time.monotonic()
+    
+        debug(
+            "PERSONALIZATION_INITIAL_START",
+            lead_id=lead["lead_id"],
+        )
+    
+        try:
+            result = self.llm.chat_json_object(
                 self.SYSTEM_PROMPT,
-                self._build_prompt(lead, research, [], "INITIAL", sender_signature),
+                self._build_prompt(
+                    lead,
+                    research,
+                    [],
+                    "INITIAL",
+                    sender_signature,
+                ),
                 max_tokens=1400,
+                operation="personalization_initial",
             )
-        )
+            draft = self._draft(result)
+    
+            debug(
+                "PERSONALIZATION_INITIAL_END",
+                lead_id=lead["lead_id"],
+                elapsed_seconds=round(time.monotonic() - started, 2),
+                eligible=draft.eligible,
+                confidence=draft.confidence,
+                body_chars=len(draft.body),
+                evidence_count=len(draft.evidence_urls),
+                anchor_count=len(draft.personalization_anchors),
+            )
+    
+            return draft
+    
+        except Exception as exc:
+            debug(
+                "PERSONALIZATION_INITIAL_ERROR",
+                lead_id=lead["lead_id"],
+                elapsed_seconds=round(time.monotonic() - started, 2),
+                type=exc.__class__.__name__,
+                message=str(exc)[:300],
+            )
+            raise
 
-    def followup(self, lead, research: dict, history: list[dict], sequence: str, sender_signature: str) -> PersonalizationDraft:
-        return self._draft(
-            self.llm.chat_json_object(
+    def followup(
+        self,
+        lead,
+        research: dict,
+        history: list[dict],
+        sequence: str,
+        sender_signature: str,
+    ) -> PersonalizationDraft:
+        started = time.monotonic()
+    
+        debug(
+            "PERSONALIZATION_FOLLOWUP_START",
+            lead_id=lead["lead_id"],
+            sequence=sequence,
+            history_count=len(history),
+        )
+    
+        try:
+            result = self.llm.chat_json_object(
                 self.FOLLOWUP_SYSTEM_PROMPT,
-                self._build_prompt(lead, research, history, sequence, sender_signature),
+                self._build_prompt(
+                    lead,
+                    research,
+                    history,
+                    sequence,
+                    sender_signature,
+                ),
                 max_tokens=1400,
+                operation="personalization_followup",
             )
-        )
-
+    
+            draft = self._draft(result)
+    
+            debug(
+                "PERSONALIZATION_FOLLOWUP_END",
+                lead_id=lead["lead_id"],
+                sequence=sequence,
+                elapsed_seconds=round(time.monotonic() - started, 2),
+                eligible=draft.eligible,
+                confidence=draft.confidence,
+                body_chars=len(draft.body),
+            )
+    
+            return draft
+    
+        except Exception as exc:
+            debug(
+                "PERSONALIZATION_FOLLOWUP_ERROR",
+                lead_id=lead["lead_id"],
+                sequence=sequence,
+                elapsed_seconds=round(time.monotonic() - started, 2),
+                type=exc.__class__.__name__,
+                message=str(exc)[:300],
+            )
+            raise
     def repair_initial(
         self,
         lead,
@@ -436,8 +545,24 @@ Keep the email concise and professional.
         draft: PersonalizationDraft,
         validation_reason: str,
     ) -> PersonalizationDraft:
-        return self._draft(
-            self.llm.chat_json_object(
+        started = time.monotonic()
+    
+        operation = (
+            "personalization_repair_initial"
+            if sequence == "INITIAL"
+            else "personalization_repair_followup"
+        )
+    
+        debug(
+            "PERSONALIZATION_REPAIR_START",
+            lead_id=lead["lead_id"],
+            sequence=sequence,
+            operation=operation,
+            reason=validation_reason,
+        )
+    
+        try:
+            result = self.llm.chat_json_object(
                 self.REPAIR_SYSTEM_PROMPT,
                 self._build_repair_prompt(
                     lead,
@@ -449,5 +574,30 @@ Keep the email concise and professional.
                     validation_reason,
                 ),
                 max_tokens=1400,
+                operation=operation,
             )
-        )
+    
+            repaired = self._draft(result)
+    
+            debug(
+                "PERSONALIZATION_REPAIR_END",
+                lead_id=lead["lead_id"],
+                sequence=sequence,
+                elapsed_seconds=round(time.monotonic() - started, 2),
+                eligible=repaired.eligible,
+                confidence=repaired.confidence,
+                body_chars=len(repaired.body),
+            )
+    
+            return repaired
+    
+        except Exception as exc:
+            debug(
+                "PERSONALIZATION_REPAIR_ERROR",
+                lead_id=lead["lead_id"],
+                sequence=sequence,
+                elapsed_seconds=round(time.monotonic() - started, 2),
+                type=exc.__class__.__name__,
+                message=str(exc)[:300],
+            )
+            raise
