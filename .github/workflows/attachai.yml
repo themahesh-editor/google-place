@@ -111,6 +111,7 @@ jobs:
       REOPEN_PERSONALIZATION_REVIEWS: ${{ inputs.reopen_personalization_reviews }}
       ENFORCE_SEND_WINDOW: 'false'
       ENFORCE_DAILY_LIMITS: 'false'
+      ATTACHAI_DEBUG: 'true'
       PYTHONUNBUFFERED: '1'
     steps:
       - name: Checkout
