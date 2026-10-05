@@ -17,7 +17,9 @@ from bs4 import BeautifulSoup
 
 from app.db import deterministic_research_id, normalize_domain
 from app.models import Evidence
+from app.debug import debug
 from app.llm import LLMClient, LLMTemporaryError
+
 
 
 EMAIL_RE = re.compile(r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,63}(?![\w.-])", re.I)
@@ -76,21 +78,87 @@ class WebsiteCrawler:
         return True if parser is None else parser.can_fetch(self.user_agent, url)
 
     def fetch(self, url: str) -> Page | None:
+        started = time.monotonic()
+    
+        debug(
+            "CRAWL_START",
+            url=url,
+        )
+    
         if not self._allowed(url):
+            debug(
+                "CRAWL_BLOCKED",
+                url=url,
+                reason="robots",
+                elapsed_seconds=round(time.monotonic() - started, 2),
+            )
             return None
+    
         try:
-            response = self.session.get(url, timeout=self.timeout_seconds, allow_redirects=True)
+            response = self.session.get(
+                url,
+                timeout=self.timeout_seconds,
+                allow_redirects=True,
+            )
+    
+            ctype = (response.headers.get("content-type") or "").lower()
+            raw = response.content
+    
+            debug(
+                "CRAWL_RESPONSE",
+                url=url,
+                final_url=response.url,
+                status=response.status_code,
+                bytes=len(raw),
+                content_type=ctype[:100],
+                elapsed_seconds=round(time.monotonic() - started, 2),
+            )
+    
             if response.status_code >= 400:
                 return None
-            ctype = (response.headers.get("content-type") or "").lower()
+    
             if ctype and "html" not in ctype and "xhtml" not in ctype:
                 return None
-            raw = response.content
+    
             if len(raw) > self.max_bytes:
+                debug(
+                    "CRAWL_REJECTED",
+                    url=url,
+                    reason="max_bytes",
+                    bytes=len(raw),
+                    max_bytes=self.max_bytes,
+                )
                 return None
-            text = extract_visible_text(raw.decode(response.encoding or "utf-8", errors="ignore"), 12000)
-            return Page(response.url, text, raw.decode(response.encoding or "utf-8", errors="ignore"))
-        except Exception:
+    
+            decoded = raw.decode(
+                response.encoding or "utf-8",
+                errors="ignore",
+            )
+    
+            text = extract_visible_text(decoded, 12000)
+    
+            debug(
+                "CRAWL_END",
+                url=url,
+                status="SUCCESS",
+                text_chars=len(text),
+                elapsed_seconds=round(time.monotonic() - started, 2),
+            )
+    
+            return Page(
+                response.url,
+                text,
+                decoded,
+            )
+    
+        except Exception as exc:
+            debug(
+                "CRAWL_ERROR",
+                url=url,
+                type=exc.__class__.__name__,
+                message=str(exc)[:300],
+                elapsed_seconds=round(time.monotonic() - started, 2),
+            )
             return None
 
     def _sitemap_urls(self, home: str) -> list[str]:
@@ -184,13 +252,29 @@ class WebsiteCrawler:
         return urls[:self.max_pages]
 
     def crawl(self, website: str) -> list[Page]:
+        debug(
+            "CRAWL_SITE_START",
+            website=website,
+            max_pages=self.max_pages,
+        )
+    
         pages: list[Page] = []
+    
         for index, url in enumerate(self.discover_urls(website)):
             page = self.fetch(url)
+    
             if page and page.text:
                 pages.append(page)
+    
             if index + 1 < self.max_pages:
                 time.sleep(max(0.0, self.delay_seconds))
+    
+        debug(
+            "CRAWL_SITE_END",
+            website=website,
+            pages=len(pages),
+        )
+    
         return pages
 
 
@@ -308,9 +392,24 @@ evidence_urls must be a subset of supplied URLs.
         self.version = version
 
     def run(self, lead, run_id: str):
+        started = time.monotonic()
+    
+        debug(
+            "RESEARCH_START",
+            lead_id=lead["lead_id"],
+            website=lead["website"],
+        )
+    
         timestamp = datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         pages = self.crawler.crawl(lead["website"])
         evidence = [Evidence(p.url, p.text[:2000]) for p in pages if p.text]
+        
+        debug(
+            "RESEARCH_CRAWL_DONE",
+            lead_id=lead["lead_id"],
+            pages=len(pages),
+            evidence_count=len(evidence),
+        )
         if not evidence:
             record = self._record(lead, timestamp, [], "FAILED", self.version, error="no_website_evidence")
             self.store.save_research(record)
@@ -323,12 +422,28 @@ evidence_urls must be a subset of supplied URLs.
             f"Current discovery facts: {lead.get('discovery_facts','')[:3000]}\n\nWEBSITE EVIDENCE ONLY\n{blob}"
         )
         try:
-            obj = self.llm.chat_json_object(self.SYSTEM_PROMPT, prompt, max_tokens=1400)
+            obj = self.llm.chat_json_object(
+                self.SYSTEM_PROMPT,
+                prompt,
+                max_tokens=1400,
+                operation="research",
+            )
         except LLMTemporaryError as exc:
             record = self._record(lead, timestamp, evidence, "PARTIAL_LLM_FAILURE", self.version, error=str(exc))
             self.store.save_research(record)
             self.store.update_lead_status(lead["lead_id"], "ELIGIBLE")
             return record
+        debug(
+            "RESEARCH_LLM_DONE",
+            lead_id=lead["lead_id"],
+            elapsed_seconds=round(time.monotonic() - started, 2),
+            evidence_urls_returned=(
+                len(obj.get("evidence_urls", []))
+                if isinstance(obj.get("evidence_urls", []), list)
+                else 0
+            ),
+        )
+        
         allowed = {e.url for e in evidence}
         urls = [u for u in obj.get("evidence_urls", []) if isinstance(u, str) and u in allowed]
         if not urls:
@@ -346,8 +461,23 @@ evidence_urls must be a subset of supplied URLs.
             "research_version": self.version, "error": None, "retry_count": 0, "next_retry_at_utc": None,
         }
         self.store.save_research(record)
+        
+        debug(
+            "RESEARCH_SAVED",
+            lead_id=lead["lead_id"],
+            research_status=record["research_status"],
+            research_id=record["research_id"],
+            elapsed_seconds=round(time.monotonic() - started, 2),
+        )
+        
         self.store.update_lead_status(lead["lead_id"], "RESEARCHED")
-        self.store.add_event("research_succeeded", run_id=run_id, lead_id=lead["lead_id"], status="RESEARCHED", metadata={"research_id": record["research_id"]})
+        self.store.add_event(
+            "research_succeeded",
+            run_id=run_id,
+            lead_id=lead["lead_id"],
+            status="RESEARCHED",
+            metadata={"research_id": record["research_id"]},
+        )
         return record
 
     @staticmethod
