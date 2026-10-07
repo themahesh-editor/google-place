@@ -86,7 +86,7 @@ class FakeResearch:
         if lead["lead_id"] in self.fail_ids:
             raise LLMTemporaryError("research unavailable")
         website = lead["website"]
-        pages = [Page(website, "Home", f"{lead["company"]} lists consulting services on its website.", (), (lead["email"],))]
+        pages = [Page(website, "Home", f'{lead["company"]} lists consulting services on its website.', (), (lead["email"],))]
         research = {
             "company_identity": lead["company"],
             "business_summary": "Consulting services",
