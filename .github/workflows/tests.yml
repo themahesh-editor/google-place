@@ -1,0 +1,43 @@
+name: AttachAI Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    env:
+      SUPABASE_DB_URL: sqlite://:memory:
+      NVIDIA_API_KEY: test-key
+      GOOGLE_PLACES_API_KEY: test-key
+      SENDER_1_EMAIL: sender1@example.com
+      SENDER_2_EMAIL: sender2@example.com
+      SENDER_3_EMAIL: sender3@example.com
+      SENDER_4_EMAIL: sender4@example.com
+      SENDER_5_EMAIL: sender5@example.com
+      SENDER_6_EMAIL: sender6@example.com
+      SENDER_7_EMAIL: sender7@example.com
+      SENDER_8_EMAIL: sender8@example.com
+      SENDER_9_EMAIL: sender9@example.com
+      SENDER_10_EMAIL: sender10@example.com
+      SENDER_1: test
+      SENDER_2: test
+      SENDER_3: test
+      SENDER_4: test
+      SENDER_5: test
+      SENDER_6: test
+      SENDER_7: test
+      SENDER_8: test
+      SENDER_9: test
+      SENDER_10: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m pip install -r requirements.txt
+      - run: python -m unittest discover -s tests -p 'test_*.py' -v

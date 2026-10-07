@@ -1,0 +1,103 @@
+# AttachAI operational control plane.
+# Secrets NEVER live here. Edit this file to change runtime behavior.
+application:
+  timezone: Asia/Kolkata
+
+automation:
+  enabled: false
+  # GitHub Actions polls every 15 minutes; this file controls whether a poll is due.
+  outreach:
+    enabled: true
+    schedule: "0 9 * * 1-5"
+  followups:
+    enabled: true
+    schedule: "0 10 * * 1-5"
+
+execution:
+  target_new_initials: 100
+  batch_size: 10
+  max_concurrency: 10
+  # Safe defaults. Manual workflow inputs may override these for a single run.
+  send_enabled: false
+  dry_run: true
+  batch_gap_seconds: 0
+  send_window:
+    enforce: false
+    mode: recipient
+    start: "09:00"
+    end: "17:00"
+  daily_limits:
+    enforce: false
+    initial: 1000
+    followups: 1000
+    total: 2000
+  retry:
+    attempts: 3
+    base_seconds: 5
+    smtp_sending_lease_minutes: 30
+
+discovery:
+  # These are the business categories currently used by the source repository.
+  # Add/remove categories and keep the list focused on the actual campaign offer.
+  queries:
+    - roofing contractor
+    - HVAC contractor
+    - custom home builder
+    - residential real estate brokerage
+    - luxury realtor
+    - boutique law firm
+    - family law firm
+    - personal injury law firm
+    - cosmetic dentistry practice
+    - orthodontist
+    - remodeling contractor
+    - kitchen remodeling company
+    - bathroom remodeling company
+    - landscaping company
+    - commercial cleaning company
+    - accounting firm
+    - property management company
+    - pest control company
+    - solar installation company
+    - home inspection company
+  allowed_country_codes: [US, CA, GB, AU]
+  overage_buffer: 50
+  max_places_requests_per_run: 60
+  max_pages_per_query: 3
+  page_size: 20
+  max_candidates_per_run: 2000
+  retry_limit: 3
+  temporary_retry_hours: 24
+  no_email_retry_days: 7
+
+crawler:
+  timeout_seconds: 15
+  max_bytes: 2000000
+  max_pages: 10
+  request_delay_seconds: 0.25
+  honor_robots: true
+
+research:
+  lease_minutes: 30
+  llm_timeout_seconds: 90
+  llm_max_tokens: 1400
+
+personalization:
+  min_confidence: 0.75
+  repair_attempts: 1
+
+mailbox:
+  lookback_minutes: 180
+  max_messages_per_run: 100
+  stale_after_hours: 6
+
+runtime:
+  max_run_minutes: 300
+
+safety:
+  emergency_stop: false
+
+sender:
+  # Per-sender SMTP/IMAP settings may be overridden by SENDER_N_* environment variables.
+  # Ten sender identities are required for real sending.
+  count: 10

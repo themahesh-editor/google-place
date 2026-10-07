@@ -1,0 +1,112 @@
+name: AttachAI
+
+on:
+  workflow_dispatch:
+    inputs:
+      reset_state:
+        description: Clear ONLY application runtime/campaign data in Supabase before this run
+        required: true
+        default: false
+        type: boolean
+      target_new_initials:
+        description: NEW successful INITIAL sends required for this logical campaign run
+        required: true
+        default: 100
+        type: number
+      send_enabled:
+        description: Allow real SMTP sending for this execution
+        required: true
+        default: false
+        type: boolean
+      dry_run:
+        description: Prepare/validate without SMTP sends
+        required: true
+        default: true
+        type: boolean
+      process_followups:
+        description: Process inbound mailbox and due F1/F2/F3 follow-ups
+        required: true
+        default: true
+        type: boolean
+      process_new_outreach:
+        description: Discover/research/personalize/send new INITIAL outreach
+        required: true
+        default: true
+        type: boolean
+
+  # The local monitor.yaml schedule cannot wake GitHub Actions by itself.
+  # This polling trigger wakes the runner; the application decides whether a configured schedule is due.
+  schedule:
+    - cron: "*/15 * * * *"
+
+concurrency:
+  group: attachai-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  attachai:
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 330
+    env:
+      SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+      NVIDIA_API_KEY: ${{ secrets.NVIDIA_API_KEY }}
+      GOOGLE_PLACES_API_KEY: ${{ secrets.GOOGLE_PLACES_API_KEY }}
+      SENDER_1: ${{ secrets.SENDER_1 }}
+      SENDER_2: ${{ secrets.SENDER_2 }}
+      SENDER_3: ${{ secrets.SENDER_3 }}
+      SENDER_4: ${{ secrets.SENDER_4 }}
+      SENDER_5: ${{ secrets.SENDER_5 }}
+      SENDER_6: ${{ secrets.SENDER_6 }}
+      SENDER_7: ${{ secrets.SENDER_7 }}
+      SENDER_8: ${{ secrets.SENDER_8 }}
+      SENDER_9: ${{ secrets.SENDER_9 }}
+      SENDER_10: ${{ secrets.SENDER_10 }}
+      SENDER_1_EMAIL: ${{ vars.SENDER_1_EMAIL }}
+      SENDER_2_EMAIL: ${{ vars.SENDER_2_EMAIL }}
+      SENDER_3_EMAIL: ${{ vars.SENDER_3_EMAIL }}
+      SENDER_4_EMAIL: ${{ vars.SENDER_4_EMAIL }}
+      SENDER_5_EMAIL: ${{ vars.SENDER_5_EMAIL }}
+      SENDER_6_EMAIL: ${{ vars.SENDER_6_EMAIL }}
+      SENDER_7_EMAIL: ${{ vars.SENDER_7_EMAIL }}
+      SENDER_8_EMAIL: ${{ vars.SENDER_8_EMAIL }}
+      SENDER_9_EMAIL: ${{ vars.SENDER_9_EMAIL }}
+      SENDER_10_EMAIL: ${{ vars.SENDER_10_EMAIL }}
+      ATTACHAI_DEBUG: "true"
+      PYTHONUNBUFFERED: "1"
+      ATTACHAI_AUTO_SEND: "false"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Run deterministic test suite
+        if: github.event_name == 'workflow_dispatch'
+        run: python -m unittest discover -s tests -p 'test_*.py' -v
+
+      - name: Run scheduled AttachAI
+        if: github.event_name == 'schedule'
+        run: python -m app.main --automatic
+
+      - name: Run manual AttachAI
+        if: github.event_name == 'workflow_dispatch'
+        run: >-
+          python -m app.main
+          --monitor monitor.yaml
+          --reset-state "${{ inputs.reset_state }}"
+          --target-new-initials "${{ inputs.target_new_initials }}"
+          --send-enabled "${{ inputs.send_enabled }}"
+          --dry-run "${{ inputs.dry_run }}"
+          --process-followups "${{ inputs.process_followups }}"
+          --process-new-outreach "${{ inputs.process_new_outreach }}"
