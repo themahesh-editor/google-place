@@ -235,12 +235,10 @@ class Orchestrator:
                 continue
             process_result = self.discovery.process_candidates(workflow_id, candidates, max_workers=self.settings.max_concurrency)
             metrics.qualified += process_result.get("qualified", 0)
-            metrics.research_failed += process_result.get("retryable", 0)
+            metrics.candidate_retryable += process_result.get("retryable", 0)
+            metrics.candidate_rejected += process_result.get("rejected", 0)
             log("QUALIFICATION_PROGRESS", workflow_run_id=workflow_id, candidates=len(candidates), **process_result)
-            lead_rows = self.store.fetchall(
-                """SELECT l.* FROM lead l WHERE l.status='ELIGIBLE' AND NOT EXISTS (SELECT 1 FROM outreach o WHERE o.lead_id=l.lead_id AND o.sequence_type='INITIAL') AND NOT EXISTS (SELECT 1 FROM suppression s WHERE s.email=l.email) ORDER BY l.created_at_utc LIMIT ?""",
-                [needed_inventory],
-            )
+            lead_rows = self.store.list_leads_due_for_research(needed_inventory)
             if not lead_rows:
                 # Continue discovery, unless no provider budget remains.
                 if discovery_requests_used_total >= self.settings.discovery_max_places_requests:
@@ -273,8 +271,9 @@ class Orchestrator:
             for future in as_completed(futures):
                 lead, research_obj, pages, error = future.result()
                 if error:
-                    self.store.mark_research_retry(lead["lead_id"], delay_seconds=max(self.settings.retry_base_seconds, 5), terminal_after=self.settings.retry_limit + 1, reason=str(error)[:500])
+                    self.store.mark_research_retry(lead["lead_id"], delay_seconds=self.settings.research_retry_delay_minutes * 60, terminal_after=self.settings.retry_limit + 1, reason=str(error)[:500])
                     metrics.research_failed += 1
+                    log("RESEARCH_FAILED", workflow_run_id=workflow_id, lead_id=lead["lead_id"], company=lead.get("company", ""), website=lead.get("website", ""), reason=str(error)[:500])
                     self.store.add_event("research_failed", run_id=workflow_id, campaign_id=campaign_id, lead_id=lead["lead_id"], reason=str(error)[:500])
                     continue
                 self.store.set_lead_status(lead["lead_id"], "RESEARCHED")
@@ -292,6 +291,7 @@ class Orchestrator:
                         self.store.set_lead_status(lead["lead_id"], "REVIEW_NEEDED")
                         metrics.personalization_rejected += 1
                         self.store.add_event("personalization_rejected", run_id=workflow_id, campaign_id=campaign_id, lead_id=lead["lead_id"], reason="; ".join(validation.reasons))
+                        log("PERSONALIZATION_REJECTED", workflow_run_id=workflow_id, lead_id=lead["lead_id"], company=lead.get("company", ""), reasons=list(validation.reasons))
                         continue
                     ok = self.store.insert_outreach({
                         "outreach_id": outreach_id,
@@ -318,6 +318,7 @@ class Orchestrator:
                     self.store.set_lead_status(lead["lead_id"], "REVIEW_NEEDED")
                     metrics.personalization_rejected += 1
                     self.store.add_event("personalization_failed", run_id=workflow_id, campaign_id=campaign_id, lead_id=lead["lead_id"], reason=str(exc)[:500])
+                    log("PERSONALIZATION_FAILED", workflow_run_id=workflow_id, lead_id=lead["lead_id"], company=lead.get("company", ""), reason=str(exc)[:500])
         return prepared
 
     def _send_rows(self, workflow_id: str, campaign_id: str, rows: list[Any], *, batch_type: str, send_enabled: bool, dry_run: bool, metrics: RunMetrics) -> int:
