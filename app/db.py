@@ -366,6 +366,18 @@ class Store:
     def set_lead_status(self, lead_id: str, status: str, suppression_reason: str | None = None) -> None:
         self.execute("UPDATE lead SET status=?,suppression_reason=COALESCE(?,suppression_reason),updated_at_utc=? WHERE lead_id=?", [status, suppression_reason, now_utc(), lead_id])
 
+    def list_leads_due_for_research(self, limit: int) -> list[Any]:
+        """Return eligible leads whose durable research retry time has arrived."""
+        return self.fetchall(
+            """SELECT l.* FROM lead l
+               WHERE l.status='ELIGIBLE'
+                 AND (l.next_research_at_utc IS NULL OR l.next_research_at_utc <= ?)
+                 AND NOT EXISTS (SELECT 1 FROM outreach o WHERE o.lead_id=l.lead_id AND o.sequence_type='INITIAL')
+                 AND NOT EXISTS (SELECT 1 FROM suppression s WHERE s.email=l.email)
+               ORDER BY l.created_at_utc LIMIT ?""",
+            [now_utc(), max(0, int(limit))],
+        )
+
     def record_retry(self, entity_type: str, entity_id: str, attempt_number: int, error_class: str, error_message: str) -> None:
         self.execute(
             "INSERT INTO retry_attempt(retry_id,entity_type,entity_id,attempt_number,error_class,error_message,created_at_utc) VALUES(?,?,?,?,?,?,?)",
