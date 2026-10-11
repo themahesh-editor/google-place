@@ -89,6 +89,7 @@ class Settings:
     retry_base_seconds: int
     smtp_sending_lease_minutes: int
     research_lease_minutes: int
+    research_retry_delay_minutes: int
     personalization_retry_limit: int
     min_personalization_confidence: float
     followup_1_delay_hours: int
@@ -179,6 +180,7 @@ class Settings:
             retry_base_seconds=_int(retry.get("base_seconds"), 5),
             smtp_sending_lease_minutes=_int(retry.get("smtp_sending_lease_minutes"), 30),
             research_lease_minutes=_int(research.get("lease_minutes"), 30),
+            research_retry_delay_minutes=_int(research.get("retry_delay_minutes"), 60),
             personalization_retry_limit=_int(personalization.get("repair_attempts"), 1),
             min_personalization_confidence=_float(personalization.get("min_confidence"), 0.75),
             followup_1_delay_hours=_int(followups.get("f1_delay_hours"), 24),
@@ -271,6 +273,8 @@ class Settings:
             raise ValueError("discovery.queries must contain at least one query")
         if self.discovery_overage_buffer < 0 or self.max_candidates_per_run < 1:
             raise ValueError("discovery buffer/candidate bounds are invalid")
+        if self.research_retry_delay_minutes < 1:
+            raise ValueError("research.retry_delay_minutes must be >= 1")
         if self.followup_1_delay_hours < 1 or self.followup_2_delay_days < 1 or self.followup_3_delay_days < 1:
             raise ValueError("follow-up delays must be positive")
         if not (0 <= self.min_personalization_confidence <= 1):
