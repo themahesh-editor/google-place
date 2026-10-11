@@ -103,16 +103,21 @@ def extract_emails(page: Page) -> list[str]:
 
 
 def choose_public_business_email(pages: list[Page], website: str, has_mx) -> tuple[str, str] | None:
+    """Choose a verifiable email explicitly published on the business's own website.
+
+    Prefer the website's own domain. Some small businesses publish a public Gmail/Yahoo/etc.
+    contact address on their official site; accept those as a fallback after MX validation.
+    Do not accept arbitrary third-party domains.
+    """
     domain = normalize_domain(website)
-    candidates: list[tuple[int, str, str]] = []
+    candidates: list[tuple[int, int, str, str]] = []
     for page in pages:
         for email in extract_emails(page):
             local, _, edomain = email.partition("@")
-            if not edomain or email in BLOCKED_LOCAL_PARTS or local in BLOCKED_LOCAL_PARTS:
+            if not edomain or local in BLOCKED_LOCAL_PARTS:
                 continue
-            if edomain in FREE_EMAIL_DOMAINS and edomain != domain:
-                continue
-            if edomain != domain:
+            same_domain = edomain == domain
+            if not same_domain and edomain not in FREE_EMAIL_DOMAINS:
                 continue
             if not has_mx(edomain):
                 continue
@@ -123,11 +128,11 @@ def choose_public_business_email(pages: list[Page], website: str, has_mx) -> tup
                 score += 20
             if "team" in page.url or "about" in page.url:
                 score += 5
-            candidates.append((score, email, page.url))
+            candidates.append((1 if same_domain else 0, score, email, page.url))
     if not candidates:
         return None
-    candidates.sort(key=lambda item: (-item[0], item[1], item[2]))
-    return candidates[0][1], candidates[0][2]
+    candidates.sort(key=lambda item: (-item[0], -item[1], item[2], item[3]))
+    return candidates[0][2], candidates[0][3]
 
 
 class WebsiteCrawler:
@@ -144,7 +149,10 @@ class WebsiteCrawler:
     def _allowed(self, robots: urllib.robotparser.RobotFileParser | None, url: str) -> bool:
         if not self.honor_robots or robots is None:
             return True
-        return robots.can_fetch(self.user_agent, url)
+        allowed = robots.can_fetch(self.user_agent, url)
+        if not allowed:
+            debug("CRAWL_ROBOTS_BLOCKED", url=url, user_agent=self.user_agent)
+        return allowed
 
     def _load_robots(self, session: requests.Session, origin: str) -> urllib.robotparser.RobotFileParser | None:
         if not self.honor_robots:
@@ -156,8 +164,9 @@ class WebsiteCrawler:
             if response.status_code < 400:
                 rp.parse(response.text.splitlines())
                 return rp
-        except requests.RequestException:
-            pass
+            debug("CRAWL_ROBOTS_HTTP_ERROR", url=rp.url, http_status=response.status_code)
+        except requests.RequestException as exc:
+            debug("CRAWL_ROBOTS_FETCH_FAILED", url=rp.url, error_type=type(exc).__name__, reason=str(exc)[:300])
         return None
 
     def fetch(self, session: requests.Session, url: str, robots: urllib.robotparser.RobotFileParser | None) -> Page | None:
@@ -167,6 +176,7 @@ class WebsiteCrawler:
         try:
             response = session.get(canonical, timeout=self.timeout_seconds, stream=True, allow_redirects=True)
             if response.status_code >= 400:
+                debug("CRAWL_HTTP_ERROR", url=canonical, final_url=getattr(response, "url", canonical), http_status=response.status_code)
                 return None
             content = bytearray()
             for chunk in response.iter_content(65536):
@@ -174,10 +184,18 @@ class WebsiteCrawler:
                 if len(content) > self.max_bytes:
                     break
             if len(content) > self.max_bytes:
+                debug("CRAWL_TOO_LARGE", url=canonical, bytes_read=len(content), max_bytes=self.max_bytes)
                 return None
             encoding = response.encoding or "utf-8"
             html = bytes(content).decode(encoding, errors="replace")
-        except (requests.RequestException, UnicodeError):
+        except requests.Timeout as exc:
+            debug("CRAWL_TIMEOUT", url=canonical, timeout_seconds=self.timeout_seconds, reason=str(exc)[:300])
+            return None
+        except requests.ConnectionError as exc:
+            debug("CRAWL_CONNECTION_ERROR", url=canonical, error_type=type(exc).__name__, reason=str(exc)[:300])
+            return None
+        except (requests.RequestException, UnicodeError) as exc:
+            debug("CRAWL_FETCH_ERROR", url=canonical, error_type=type(exc).__name__, reason=str(exc)[:300])
             return None
         soup = BeautifulSoup(html, "html.parser")
         links: list[str] = []
@@ -195,7 +213,10 @@ class WebsiteCrawler:
             decoded = decode_cloudflare_email(el.get("data-cfemail", ""))
             if decoded:
                 email_values.update(email_strings(decoded))
-        return Page(canonicalize(response.url), title, extract_visible_text(html), tuple(sorted(set(links))), tuple(sorted(email_values)))
+        visible_text = extract_visible_text(html)
+        if not visible_text and not email_values:
+            debug("CRAWL_NO_VISIBLE_CONTENT", url=canonical, http_status=response.status_code, content_type=response.headers.get("Content-Type", ""))
+        return Page(canonicalize(response.url), title, visible_text, tuple(sorted(set(links))), tuple(sorted(email_values)))
 
     def discover_urls(self, home: Page) -> list[str]:
         origin = f"{urlparse(home.url).scheme}://{urlparse(home.url).netloc}/"
@@ -305,6 +326,7 @@ Use only the supplied page evidence. Never invent facts. Keep arrays concise and
         if not pages:
             cache_id = self.store.save_research_cache(canonical, self.version, [], {}, "FAILED", "no crawlable pages")
             self.store.save_lead_research(lead["lead_id"], cache_id, "FAILED_TERMINAL", "no crawlable pages")
+            debug("RESEARCH_FAILURE", lead_id=lead["lead_id"], company=lead.get("company", ""), website=canonical, stage="crawl", reason="no crawlable pages")
             raise RuntimeError("website crawl returned no pages")
 
         evidence_lines = []
@@ -328,7 +350,14 @@ Use only the supplied page evidence. Never invent facts. Keep arrays concise and
             self.store.save_lead_research(lead["lead_id"], cache_id, "FAILED_TERMINAL", str(exc)[:500])
             raise
 
-        validated = validate_research_schema(obj)
+        try:
+            validated = validate_research_schema(obj)
+        except LLMInvalidResponse as exc:
+            reason = str(exc)[:500]
+            cache_id = self.store.save_research_cache(canonical, self.version, pages, {}, "PARTIAL_LLM_FAILURE", reason)
+            self.store.save_lead_research(lead["lead_id"], cache_id, "FAILED_RETRYABLE", reason)
+            debug("RESEARCH_SCHEMA_INVALID", lead_id=lead["lead_id"], company=lead.get("company", ""), website=canonical, reason=reason)
+            raise
         clean = {
             "company_identity": str(validated["company_identity"] or lead["company"]),
             "business_summary": str(obj.get("business_summary") or "").strip(),
