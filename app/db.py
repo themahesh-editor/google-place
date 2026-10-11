@@ -265,9 +265,22 @@ class Store:
             """UPDATE discovery_candidate
                SET status='RETRYABLE', next_retry_at_utc=?,
                    last_reason='requeued_after_crawler_url_validation_fix', last_seen_at_utc=?
-               WHERE status='RETRYABLE'
-                 AND (last_reason LIKE '%Port could not be cast to integer%'
-                      OR last_reason LIKE '%Port out of range 0-65535%')""",
+
+                    cur = self.execute(
+                        """UPDATE discovery_candidate
+                           SET status='RETRYABLE', next_retry_at_utc=?,
+                               last_reason='requeued_after_crawler_url_validation_fix',
+                               last_seen_at_utc=?
+                           WHERE status='RETRYABLE'
+                             AND (last_reason LIKE ?
+                                  OR last_reason LIKE ?)""",
+                        [
+                            now,
+                            now,
+                            "%Port could not be cast to integer%",
+                            "%Port out of range 0-65535%",
+                        ],
+                    )
             [now, now],
         )
         try:
