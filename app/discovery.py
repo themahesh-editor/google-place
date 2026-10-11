@@ -178,6 +178,21 @@ Use only the supplied candidate and website evidence. Do not invent facts. Rejec
                         timeout=self.settings.crawler_timeout_seconds,
                     )
                     used += 1
+                    if response.status_code >= 400:
+                        try:
+                            body_for_log = response.json()
+                            api_error = body_for_log.get("error", {}) if isinstance(body_for_log, dict) else {}
+                        except (ValueError, TypeError):
+                            api_error = {"message": getattr(response, "text", "")[:300]}
+                        debug(
+                            "GOOGLE_PLACES_ERROR",
+                            query=query,
+                            http_status=response.status_code,
+                            api_status=str(api_error.get("status", ""))[:100],
+                            api_code=api_error.get("code"),
+                            message=str(api_error.get("message", ""))[:300],
+                            attempt=attempt + 1,
+                        )
                     if response.status_code in {429, 500, 502, 503, 504} and attempt < 2:
                         time.sleep(2 * (attempt + 1))
                         continue
@@ -282,7 +297,7 @@ Use only the supplied candidate and website evidence. Do not invent facts. Rejec
         try:
             pages = self.crawler.crawl(candidate.website)
             if not pages:
-                return CandidateEvaluation("retry", cid, candidate, "website_inaccessible", retry_seconds=self.settings.candidate_retry_hours * 3600)
+                return CandidateEvaluation("retry", cid, candidate, "website_inaccessible:no_crawlable_pages", retry_seconds=self.settings.candidate_retry_hours * 3600)
             email_choice = choose_public_business_email(pages, candidate.website, self._has_mx)
             if not email_choice:
                 return CandidateEvaluation("retry", cid, candidate, "no_public_business_email", retry_seconds=self.settings.candidate_no_email_retry_days * 86400)
@@ -342,6 +357,16 @@ Use only the supplied candidate and website evidence. Do not invent facts. Rejec
                 row = futures[future]
                 cid = result.candidate_id
                 attempts = int(row["attempts"] or 0) + 1
+                debug(
+                    "CANDIDATE_EVALUATION",
+                    run_id=run_id,
+                    candidate_id=cid,
+                    company=result.candidate.company,
+                    website=result.candidate.website,
+                    outcome=result.outcome,
+                    reason=result.reason[:500],
+                    attempt=attempts,
+                )
                 if result.outcome == "verified" and result.lead:
                     try:
                         existing_email = self.store.get_lead_by_email(result.lead["email"])
@@ -373,6 +398,7 @@ Use only the supplied candidate and website evidence. Do not invent facts. Rejec
                         next_retry = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=max(result.retry_seconds, self.settings.retry_base_seconds))
                         self.store.set_candidate_result(cid, "RETRYABLE", reason=result.reason, next_retry_at=next_retry, increment_attempt=True)
                         counts["retryable"] += 1
+        debug("CANDIDATE_PROCESSING_SUMMARY", run_id=run_id, **counts)
         return counts
 
     def run(self, run_id: str, required_inventory: int) -> dict[str, int]:
