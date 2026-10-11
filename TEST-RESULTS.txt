@@ -1,0 +1,13 @@
+Local verification report
+========================
+Command: python -m unittest discover -s tests -p 'test_*.py' -v
+Result: PASS
+Tests: 62
+Duration: 0.827 seconds (this packaging run)
+
+Command: python -m compileall -q app tests
+Result: PASS
+
+Scope note: Tests use SQLite and fake providers. They do not make live Google Places,
+NVIDIA, Supabase, SMTP or IMAP calls, and they do not prove production credentials,
+quotas, deliverability or database migration compatibility.
