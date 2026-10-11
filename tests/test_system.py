@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import requests
 import tempfile
 import time
 import unittest
@@ -25,7 +26,7 @@ from app.mailbox import MailboxMonitor, classify, parse_message
 from app.models import Evidence, SendResult
 from app.monitor import pipeline_schedule_is_due
 from app.personalization import PersonalizationValidator, normalize_evidence_url
-from app.research import Page, WebsiteCrawler
+from app.research import Page, WebsiteCrawler, choose_public_business_email
 from app.orchestrator import Orchestrator
 
 ROOT = os.path.dirname(os.path.dirname(__file__))
@@ -298,6 +299,18 @@ class DeterministicIdentityTests(BaseTest):
         lead = self.lead(99); self.store.upsert_lead(lead)
         self.store.mark_research_retry(lead["lead_id"], delay_seconds=1, terminal_after=3, reason="HTTP_503")
         self.assertEqual(self.store.scalar("SELECT count(*) FROM retry_attempt WHERE entity_type=? AND entity_id=?", ["lead_research", lead["lead_id"]]), 1)
+
+    def test_19e_future_research_retry_is_not_selected_until_due(self):
+        future_lead = self.lead(190); due_lead = self.lead(191)
+        self.store.upsert_lead(future_lead); self.store.upsert_lead(due_lead)
+        self.store.execute(
+            "UPDATE lead SET next_research_at_utc=? WHERE lead_id=?",
+            [datetime.now(timezone.utc) + timedelta(hours=1), future_lead["lead_id"]],
+        )
+        due = self.store.list_leads_due_for_research(10)
+        due_ids = {row["lead_id"] for row in due}
+        self.assertIn(due_lead["lead_id"], due_ids)
+        self.assertNotIn(future_lead["lead_id"], due_ids)
 
 
 class ResumeAndSequenceTests(BaseTest):
@@ -590,6 +603,38 @@ class ExactAcceptanceTests(BaseTest):
 
 
 class BatchAndWorkflowTests(BaseTest):
+    def test_33b_research_retry_delay_is_configurable(self):
+        self.assertEqual(self.settings.research_retry_delay_minutes, 60)
+
+    def test_candidate_retry_metrics_do_not_inflate_research_failures(self):
+        class RetryDiscovery:
+            def __init__(self, store, settings):
+                self.store, self.settings = store, settings
+
+            def discover_raw(self, run_id, minimum_new_candidates, request_budget=None):
+                self.store.upsert_candidate(
+                    place_id="retry-place", company="Retry Business", website="https://retry.example/",
+                    address="Austin, TX, US", country_code="US", types=["business"], query="test",
+                )
+                return {"raw_candidates": 1, "deduplicated_candidates": 1, "queries_used": 1,
+                        "places_requests_used": self.settings.discovery_max_places_requests}
+
+            def process_candidates(self, run_id, rows, max_workers=10):
+                for row in rows:
+                    self.store.set_candidate_result(
+                        row["candidate_id"], "RETRYABLE", reason="no_public_business_email",
+                        next_retry_at=datetime.now(timezone.utc) + timedelta(days=1), increment_attempt=True,
+                    )
+                return {"qualified": 0, "rejected": 0, "retryable": len(rows), "verified": 0, "duplicates": 0}
+
+        discovery = RetryDiscovery(self.store, self.settings)
+        orch = Orchestrator(self.settings, self.store, discovery, FakeResearch(self.store), None, None, FakeMailbox())
+        code, metrics = orch.run(reset_state=False, target=1, send_enabled=False, dry_run=True,
+                                 process_followups=False, process_new_outreach=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(metrics["candidate_retryable"], 1)
+        self.assertEqual(metrics["research_failed"], 0)
+
     def test_32_replenishes_discovery_when_preparation_failures_reduce_inventory(self):
         settings = replace(self.settings, retry_base_seconds=1)
         orch = Orchestrator(settings, self.store, FakeDiscovery(self.store, chunk=2), FakeResearch(self.store), __import__('app.personalization', fromlist=['PersonalizationGenerator']).PersonalizationGenerator(FakeLLM(), .75, 0), None, FakeMailbox())
@@ -696,6 +741,28 @@ class MailboxAndCrawlerTests(BaseTest):
         monitor = MailboxMonitor(self.store, self.settings, lambda s, c: FakeIMAPProvider(s, c))
         result = monitor.run_sender(self.settings.sender_configs()[0])
         self.assertEqual(result["replies"], 1); self.assertTrue(self.store.is_suppressed(lead["email"]))
+
+    def test_42a_published_free_mailbox_is_fallback_but_domain_email_wins(self):
+        pages = [Page("https://example.com/contact", "Contact", "info@example.com hello@gmail.com", (), ())]
+        self.assertEqual(
+            choose_public_business_email(pages, "https://example.com", lambda domain: True),
+            ("info@example.com", "https://example.com/contact"),
+        )
+        fallback = [Page("https://example.com/contact", "Contact", "hello@gmail.com", (), ())]
+        self.assertEqual(
+            choose_public_business_email(fallback, "https://example.com", lambda domain: True),
+            ("hello@gmail.com", "https://example.com/contact"),
+        )
+
+    def test_42b_crawler_logs_timeout_reason(self):
+        class TimeoutSession:
+            def get(self, *args, **kwargs):
+                raise requests.Timeout("simulated timeout")
+        crawler = WebsiteCrawler(7, 100000, 2, 0, False)
+        with patch("app.research.debug") as debug_log:
+            result = crawler.fetch(TimeoutSession(), "https://example.com/", None)
+        self.assertIsNone(result)
+        self.assertTrue(any(call.args and call.args[0] == "CRAWL_TIMEOUT" for call in debug_log.call_args_list))
 
     def test_42_redundant_crawler_homepage_is_fetched_once(self):
         crawler = WebsiteCrawler(5, 100000, 3, 0, False)
