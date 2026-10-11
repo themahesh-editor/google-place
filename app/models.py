@@ -108,6 +108,8 @@ class RunMetrics:
     qualified: int = 0
     researched: int = 0
     research_failed: int = 0
+    candidate_retryable: int = 0
+    candidate_rejected: int = 0
     personalized: int = 0
     personalization_rejected: int = 0
     ready: int = 0
