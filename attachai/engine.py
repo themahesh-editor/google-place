@@ -468,12 +468,25 @@ class Engine:
             if result['status']=='sent':
                 # Delivery acceptance, predecessor creation, and its durable event
                 # commit together before any best-effort console logging.
-                accepted = self.db.accept(row['id'],self.delays,invocation_id=self.iid)
+
+                accepted = self.db.accept(
+                    row['id'],
+                    self.delays,
+                    invocation_id=self.iid
+                )
+                
                 if not accepted:
-                    # SMTP accepted the payload but durable state did not match an
-                    # eligible message. Fail closed; the next reconciliation will
-                    # turn any still-SENDING row into REVIEW, never an auto-resend.
-                    raise RuntimeError('SMTP accepted a message but durable acceptance could not be recorded; manual review is required')
+                    # SMTP may already have accepted the message.
+                    # Mark it for manual review; never automatically resend it.
+                    self.db.mark_delivery_ambiguous(
+                        row['id'],
+                        invocation_id=self.iid
+                    )
+                    raise RuntimeError(
+                        'SMTP accepted a message but durable acceptance '
+                        'could not be recorded; manual review is required'
+                    )
+
                 successful += 1
                 self.metrics['followups_sent' if row['sequence'] else 'successful_initial_sends'] += 1
             else:
