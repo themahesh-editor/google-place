@@ -218,11 +218,26 @@ def test_smtp_acceptance_without_durable_commit_requires_review_and_never_resend
     with pytest.raises(RuntimeError, match='manual review is required'):
         e.run()
     db.accept = original
-    row = db.one("SELECT * FROM message WHERE sequence=0")
+
+
+    # A campaign can have several sequence-0 messages: one uncertain SMTP
+    # delivery plus other messages still queued. Identify the uncertain row
+    # instead of selecting an arbitrary message.
+    ambiguous_rows = db.all(
+        """
+        SELECT *
+        FROM message
+        WHERE campaign_id=%s
+          AND sequence=0
+          AND error_kind='ambiguous'
+        ORDER BY created_at, id
+        """,
+        [e.cid],
+    )
     
-    # An uncertain SMTP acceptance must be quarantined immediately.
+    assert len(ambiguous_rows) == 1
+    row = ambiguous_rows[0]
     assert row['status'] == 'review'
-    assert row['error_kind'] == 'ambiguous'
     
     attempt = db.one(
         """
@@ -235,6 +250,7 @@ def test_smtp_acceptance_without_durable_commit_requires_review_and_never_resend
         [row['id']],
     )
     assert attempt['status'] == 'review'
+
     
     smtp = FakeSMTP()
     resumed = engine(db,1,followups=False,smtp=smtp)
