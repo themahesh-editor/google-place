@@ -51,7 +51,7 @@ research:
   max_evidence: 12
 llm:
   base_url: https://integrate.api.nvidia.com/v1
-  model: meta/llama-3.3-70b-instruct
+  model: openai/gpt-oss-20b
   timeout_seconds: 60
   offer: AttachAI helps businesses respond to customer inquiries with an AI assistant.
   signature: AttachAI team
