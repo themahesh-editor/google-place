@@ -282,6 +282,52 @@ class Store:
                 self.accept(mid, delays, sent_at)
             self.event(None, 'operator_delivery_resolution', {'message':mid,'resolution':resolution,'evidence':evidence})
 
+
+    def mark_delivery_ambiguous(self, mid, invocation_id=None):
+        """Mark uncertain SMTP delivery for manual review; never auto-resend."""
+        with self.tx():
+            row = self.one(
+                """
+                UPDATE message
+                SET status='review',
+                    error_kind='ambiguous',
+                    last_error='SMTP acceptance could not be durably confirmed; verify provider delivery before resolution',
+                    lease_until=NULL,
+                    updated_at=now()
+                WHERE id=%s AND status='sending'
+                RETURNING id, sequence, attempts
+                """,
+                [mid],
+            )
+    
+            if not row:
+                return False
+    
+            self.execute(
+                """
+                UPDATE attempt
+                SET status='review',
+                    finished_at=now(),
+                    error_kind='ambiguous',
+                    error='SMTP acceptance could not be durably confirmed'
+                WHERE message_id=%s
+                  AND number=%s
+                  AND status='sending'
+                """,
+                [mid, row['attempts']],
+            )
+    
+            self.event(
+                invocation_id,
+                'delivery_acceptance_ambiguous',
+                {
+                    'message': mid,
+                    'sequence': row['sequence'],
+                },
+            )
+            return True
+
+
     def accept(self, mid, delays, sent_at=None, invocation_id=None):
         with self.tx():
             row = self.one("UPDATE message SET status='sent',sent_at=COALESCE(%s,now()),lease_until=NULL,next_retry=NULL,last_error=NULL,error_kind=NULL,updated_at=now() WHERE id=%s AND status IN ('sending','review') RETURNING *", [sent_at,mid])
