@@ -186,12 +186,13 @@ def test_crash_after_ten_resumes_exact_progress_and_no_resend(db):
     e = engine(db,100,followups=False)
     original = db.accept
     counter = 0
-    def interrupted(mid,delays,*args,**kwargs):
+    def interrupted(mid, delays, *args, **kwargs):
         nonlocal counter
-        original(mid,delays,*args,**kwargs)
+        accepted = original(mid, delays, *args, **kwargs)
         counter += 1
-        if counter==10:
+        if counter == 10:
             raise KeyboardInterrupt('simulated runner termination')
+        return accepted
     db.accept = interrupted
     with pytest.raises(KeyboardInterrupt):
         e.run()
@@ -481,12 +482,15 @@ def test_crash_after_27_reserves_unknown_outcomes_and_cannot_oversend(db):
     e = engine(db,100,followups=False)
     original = db.accept
     accepted = 0
-    def crash(mid,delays,**kwargs):
+
+    def crash(mid, delays, **kwargs):
         nonlocal accepted
-        original(mid,delays,**kwargs)
+        result = original(mid, delays, **kwargs)
         accepted += 1
-        if accepted==27:
+        if accepted == 27:
             raise KeyboardInterrupt()
+        return result
+
     db.accept = crash
     with pytest.raises(KeyboardInterrupt):
         e.run()
