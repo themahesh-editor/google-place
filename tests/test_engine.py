@@ -219,7 +219,23 @@ def test_smtp_acceptance_without_durable_commit_requires_review_and_never_resend
         e.run()
     db.accept = original
     row = db.one("SELECT * FROM message WHERE sequence=0")
-    assert row['status'] == 'sending'
+    
+    # An uncertain SMTP acceptance must be quarantined immediately.
+    assert row['status'] == 'review'
+    assert row['error_kind'] == 'ambiguous'
+    
+    attempt = db.one(
+        """
+        SELECT status
+        FROM attempt
+        WHERE message_id=%s
+        ORDER BY number DESC
+        LIMIT 1
+        """,
+        [row['id']],
+    )
+    assert attempt['status'] == 'review'
+    
     smtp = FakeSMTP()
     resumed = engine(db,1,followups=False,smtp=smtp)
     code,result = resumed.run()
