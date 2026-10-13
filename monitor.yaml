@@ -56,7 +56,7 @@ llm:
   offer: AttachAI helps businesses respond to customer inquiries with an AI assistant.
   signature: AttachAI team
   # REQUIRED before real sends: your genuine postal address, not a placeholder.
-  postal_address: ""
+  postal_address: "gorakhpur india"
 mailbox:
   enabled: true
   lookback_days: 30
