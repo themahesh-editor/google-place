@@ -176,6 +176,11 @@ def load_config(path="monitor.yaml", overrides: dict | None = None) -> Config:
         if values.keys() - data[section].keys():
             raise ValueError(f"monitor.yaml has unknown controls in {section}")
         data[section].update(values)
+
+        postal_address = os.environ.get("POSTAL_ADDRESS", "").strip()
+        if postal_address:
+            data["llm"]["postal_address"] = postal_address
+    
     _validate(data)
     overrides = {} if overrides is None else overrides
     allowed = {"reset_state", "target_new_initials", "send_enabled", "dry_run", "process_followups", "process_new_outreach"}
