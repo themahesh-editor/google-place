@@ -36,7 +36,13 @@ retry:
   max_seconds: 60
   sender_cooldown_seconds: 30
 discovery:
-  queries: ["dentist in Austin Texas"]
+  queries:
+    - "emergency dentist in Austin Texas"
+    - "weekend dentist in Austin Texas"
+    - "after hours dentist in Austin Texas"
+    - "same day dentist in Austin Texas"
+    - "emergency dentist in Round Rock Texas"
+    - "emergency dentist in Cedar Park Texas"
   max_requests_per_run: 100
   max_candidates_per_run: 2000
   buffer_ratio: 1.5
@@ -56,7 +62,7 @@ llm:
   offer: AttachAI helps businesses respond to customer inquiries with an AI assistant.
   signature: AttachAI team
   # REQUIRED before real sends: your genuine postal address, not a placeholder.
-  postal_address: "gorakhpur india"
+  postal_address: "Gorakhpur India"
 mailbox:
   enabled: true
   lookback_days: 30
