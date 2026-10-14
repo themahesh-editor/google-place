@@ -180,144 +180,144 @@ class Discovery:
         return {"candidates": candidates, "next_page_token": token, "requests_used": 1}
 
 
-    _DNS_SLOTS = threading.BoundedSemaphore(10)
-    
-    
-    def _public_addresses(host: str, port: int, timeout: float = 15) -> list[str]:
-        started = time.monotonic()
-    
-        if not _DNS_SLOTS.acquire(timeout=max(0, timeout)):
-            raise ProviderError("temporary", "Website DNS capacity unavailable")
-    
-        result = queue.Queue(maxsize=1)
-    
-        def resolve():
-            try:
-                result.put(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
-            except OSError:
-                result.put(None)
-            finally:
-                _DNS_SLOTS.release()
-    
-        threading.Thread(target=resolve, daemon=True).start()
-    
+_DNS_SLOTS = threading.BoundedSemaphore(10)
+
+
+def _public_addresses(host: str, port: int, timeout: float = 15) -> list[str]:
+    started = time.monotonic()
+
+    if not _DNS_SLOTS.acquire(timeout=max(0, timeout)):
+        raise ProviderError("temporary", "Website DNS capacity unavailable")
+
+    result = queue.Queue(maxsize=1)
+
+    def resolve():
         try:
-            records = result.get(
-                timeout=max(0, timeout - (time.monotonic() - started))
-            )
-    
-            if records is None:
-                raise OSError
-    
-            addresses = sorted({row[4][0] for row in records})
-    
-            if not addresses or any(
-                not ipaddress.ip_address(ip).is_global
-                or ipaddress.ip_address(ip).is_multicast
-                for ip in addresses
-            ):
-                raise ProviderError(
-                    "terminal",
-                    "Website network destination is prohibited",
-                )
-    
-            return addresses
-    
-        except ProviderError:
-            raise
-        except (OSError, ValueError, queue.Empty):
-            raise ProviderError("temporary", "Website DNS lookup failed") from None
-    
-    
-    class _PinnedHTTP(http.client.HTTPConnection):
-        def __init__(self, host, port, address, timeout):
-            super().__init__(host, port=port, timeout=timeout)
-            self.address = address
-            self._deadline_timer = None
-            self._expires = time.monotonic() + timeout
-    
-        def _arm_deadline(self):
-            sock = self.sock
-    
-            def abort():
-                try:
-                    sock.shutdown(socket.SHUT_RDWR)
-                except OSError:
-                    pass
-    
-            self._deadline_timer = threading.Timer(
-                max(0, self._expires - time.monotonic()),
-                abort,
-            )
-            self._deadline_timer.daemon = True
-            self._deadline_timer.start()
-    
-        def connect(self):
-            self.sock = socket.create_connection(
-                (self.address, self.port),
-                self.timeout,
-            )
-            self._arm_deadline()
-    
-    
-    class _PinnedHTTPS(_PinnedHTTP):
-        def connect(self):
-            self.sock = socket.create_connection(
-                (self.address, self.port),
-                self.timeout,
-            )
-            self.sock.settimeout(
-                max(0.001, self._expires - time.monotonic())
-            )
-            self.sock = ssl.create_default_context().wrap_socket(
-                self.sock,
-                server_hostname=self.host,
-            )
-            self._arm_deadline()
-    
-    
-    _UI_NOISE = re.compile(
-        r"(?i)\b("
-        r"skip to content|schedule online|call now|"
-        r"privacy policy|terms of use|cookie policy|"
-        r"all rights reserved|read more"
-        r")\b"
-    )
-    
-    
-    def _clean_visible_text(value: str) -> str:
-        """Normalize visible text and remove private-use icon-font characters."""
-        value = unicodedata.normalize("NFKC", str(value or ""))
-    
-        value = "".join(
-            char
-            for char in value
-            if unicodedata.category(char) not in {"Co", "Cf"}
+            result.put(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
+        except OSError:
+            result.put(None)
+        finally:
+            _DNS_SLOTS.release()
+
+    threading.Thread(target=resolve, daemon=True).start()
+
+    try:
+        records = result.get(
+            timeout=max(0, timeout - (time.monotonic() - started))
         )
-    
-        return re.sub(r"\s+", " ", value).strip()
-    
-    
-    def _usable_evidence_snippet(value: str) -> bool:
-        """Accept concise, readable sentences instead of UI fragments."""
-        value = _clean_visible_text(value)
-    
-        if not 40 <= len(value) <= 260:
-            return False
-    
-        if "|" in value or re.search(r"[◆■□►▶●•]", value):
-            return False
-    
-        if _UI_NOISE.search(value):
-            return False
-    
-        if not re.search(r"""[.!?]["'”’)]?$""", value):
-            return False
-    
-        if sum(char.isalpha() for char in value) < 25:
-            return False
-    
-        return True
+
+        if records is None:
+            raise OSError
+
+        addresses = sorted({row[4][0] for row in records})
+
+        if not addresses or any(
+            not ipaddress.ip_address(ip).is_global
+            or ipaddress.ip_address(ip).is_multicast
+            for ip in addresses
+        ):
+            raise ProviderError(
+                "terminal",
+                "Website network destination is prohibited",
+            )
+
+        return addresses
+
+    except ProviderError:
+        raise
+    except (OSError, ValueError, queue.Empty):
+        raise ProviderError("temporary", "Website DNS lookup failed") from None
+
+
+class _PinnedHTTP(http.client.HTTPConnection):
+    def __init__(self, host, port, address, timeout):
+        super().__init__(host, port=port, timeout=timeout)
+        self.address = address
+        self._deadline_timer = None
+        self._expires = time.monotonic() + timeout
+
+    def _arm_deadline(self):
+        sock = self.sock
+
+        def abort():
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+        self._deadline_timer = threading.Timer(
+            max(0, self._expires - time.monotonic()),
+            abort,
+        )
+        self._deadline_timer.daemon = True
+        self._deadline_timer.start()
+
+    def connect(self):
+        self.sock = socket.create_connection(
+            (self.address, self.port),
+            self.timeout,
+        )
+        self._arm_deadline()
+
+
+class _PinnedHTTPS(_PinnedHTTP):
+    def connect(self):
+        self.sock = socket.create_connection(
+            (self.address, self.port),
+            self.timeout,
+        )
+        self.sock.settimeout(
+            max(0.001, self._expires - time.monotonic())
+        )
+        self.sock = ssl.create_default_context().wrap_socket(
+            self.sock,
+            server_hostname=self.host,
+        )
+        self._arm_deadline()
+
+
+_UI_NOISE = re.compile(
+    r"(?i)\b("
+    r"skip to content|schedule online|call now|"
+    r"privacy policy|terms of use|cookie policy|"
+    r"all rights reserved|read more"
+    r")\b"
+)
+
+
+def _clean_visible_text(value: str) -> str:
+    """Normalize visible text and remove private-use icon-font characters."""
+    value = unicodedata.normalize("NFKC", str(value or ""))
+
+    value = "".join(
+        char
+        for char in value
+        if unicodedata.category(char) not in {"Co", "Cf"}
+    )
+
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _usable_evidence_snippet(value: str) -> bool:
+    """Accept concise, readable sentences instead of UI fragments."""
+    value = _clean_visible_text(value)
+
+    if not 25 <= len(value) <= 260:
+        return False
+
+    if "|" in value or re.search(r"[◆■□►▶●•]", value):
+        return False
+
+    if _UI_NOISE.search(value):
+        return False
+
+    if not re.search(r"""[.!?]["'”’)]?$""", value):
+        return False
+
+    if sum(char.isalpha() for char in value) < 25:
+        return False
+
+    return True
 
 
 class Research:
