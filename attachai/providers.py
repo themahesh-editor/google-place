@@ -446,7 +446,7 @@ class Research:
         crawl_queue = [start]
         seen_pages = set()
     
-        while crawl_queue and len(seen_pages) < self.config["max_pages"]:
+        while crawl_queue and len(pages) < self.config["max_pages"]:
             url = crawl_queue.pop(0)
             key = normalize_url(url)
     
