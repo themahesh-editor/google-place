@@ -37,15 +37,37 @@ def credentials(monkeypatch, count=10):
 
 def test_repository_defaults_are_safe():
     config = load_config(Path(__file__).resolve().parents[1] / "monitor.yaml")
-    assert config.data == DEFAULTS
+
     assert not config.data["automation"]["enabled"]
-    assert not config.send_enabled and config.dry_run
-    assert config.process_followups and config.process_new_outreach
+    assert config.data["safety"]["send_enabled"] is False
+    assert config.data["safety"]["dry_run"] is True
+
+    assert not config.send_enabled
+    assert config.dry_run
+    assert config.process_followups
+    assert config.process_new_outreach
     assert config.target == 100
+
+    # Operator-configured discovery queries are allowed.
+    assert config.data["discovery"]["queries"]
+    assert all(
+        isinstance(query, str) and query.strip()
+        for query in config.data["discovery"]["queries"]
+    )
+
     limits = config.data["limits"]
-    assert not any(limits[k] for k in ("send_window_enabled", "daily_sender_enabled", "daily_total_enabled"))
+    assert not any(
+        limits[key]
+        for key in (
+            "send_window_enabled",
+            "daily_sender_enabled",
+            "daily_total_enabled",
+        )
+    )
     assert limits["batch_gap_seconds"] == 0
 
+    # No postal address should be committed into the public config.
+    assert config.data["llm"]["postal_address"] == ""
 
 @pytest.mark.parametrize("value,expected", [(True, True), (False, False), ("true", True), ("false", False), (" FALSE ", False)])
 def test_booleans(value, expected):
