@@ -9,6 +9,7 @@ import hashlib
 import http.client
 import imaplib
 import ipaddress
+import unicodedata
 import json
 import queue
 import re
@@ -179,69 +180,112 @@ class Discovery:
         return {"candidates": candidates, "next_page_token": token, "requests_used": 1}
 
 
-_DNS_SLOTS = threading.BoundedSemaphore(10)
-
-
-def _public_addresses(host: str, port: int, timeout: float = 15) -> list[str]:
-    # libc DNS resolution has no per-call timeout. Bound caller waiting and cap
-    # lingering resolver workers globally; a DNS outage cannot leak unbounded
-    # threads or hold the coordinator's network workers forever.
-    started = time.monotonic()
-    if not _DNS_SLOTS.acquire(timeout=max(0, timeout)):
-        raise ProviderError("temporary", "Website DNS capacity unavailable")
-    result = queue.Queue(maxsize=1)
-    def resolve():
-        try:
-            result.put(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
-        except OSError:
-            result.put(None)
-        finally:
-            _DNS_SLOTS.release()
-    threading.Thread(target=resolve, daemon=True).start()
-    try:
-        records = result.get(timeout=max(0, timeout - (time.monotonic() - started)))
-        if records is None:
-            raise OSError
-        addresses = sorted({row[4][0] for row in records})
-        if not addresses or any(not ipaddress.ip_address(ip).is_global or ipaddress.ip_address(ip).is_multicast for ip in addresses):
-            raise ProviderError("terminal", "Website network destination is prohibited")
-        return addresses
-    except ProviderError:
-        raise
-    except (OSError, ValueError, queue.Empty):
-        raise ProviderError("temporary", "Website DNS lookup failed") from None
-
-
-class _PinnedHTTP(http.client.HTTPConnection):
-    def __init__(self, host, port, address, timeout):
-        super().__init__(host, port=port, timeout=timeout)
-        self.address = address
-        self._deadline_timer = None
-        self._expires = time.monotonic() + timeout
-
-    def _arm_deadline(self):
-        sock = self.sock
-        def abort():
+    _DNS_SLOTS = threading.BoundedSemaphore(10)
+    
+    
+    def _public_addresses(host: str, port: int, timeout: float = 15) -> list[str]:
+        # libc DNS resolution has no per-call timeout. Bound caller waiting and cap
+        # lingering resolver workers globally; a DNS outage cannot leak unbounded
+        # threads or hold the coordinator's network workers forever.
+        started = time.monotonic()
+        if not _DNS_SLOTS.acquire(timeout=max(0, timeout)):
+            raise ProviderError("temporary", "Website DNS capacity unavailable")
+        result = queue.Queue(maxsize=1)
+        def resolve():
             try:
-                sock.shutdown(socket.SHUT_RDWR)
+                result.put(socket.getaddrinfo(host, port, type=socket.SOCK_STREAM))
             except OSError:
-                pass
-        self._deadline_timer = threading.Timer(max(0, self._expires - time.monotonic()), abort)
-        self._deadline_timer.daemon = True
-        self._deadline_timer.start()
-
-    def connect(self):
-        self.sock = socket.create_connection((self.address, self.port), self.timeout)
-        self._arm_deadline()
-
-class _PinnedHTTPS(_PinnedHTTP):
-    def connect(self):
-        # Handshake has a socket timeout; the wall-clock timer then also bounds
-        # slow trickle responses that would otherwise reset per-read timeouts.
-        self.sock = socket.create_connection((self.address, self.port), self.timeout)
-        self.sock.settimeout(max(0.001, self._expires - time.monotonic()))
-        self.sock = ssl.create_default_context().wrap_socket(self.sock, server_hostname=self.host)
-        self._arm_deadline()
+                result.put(None)
+            finally:
+                _DNS_SLOTS.release()
+        threading.Thread(target=resolve, daemon=True).start()
+        try:
+            records = result.get(timeout=max(0, timeout - (time.monotonic() - started)))
+            if records is None:
+                raise OSError
+            addresses = sorted({row[4][0] for row in records})
+            if not addresses or any(not ipaddress.ip_address(ip).is_global or ipaddress.ip_address(ip).is_multicast for ip in addresses):
+                raise ProviderError("terminal", "Website network destination is prohibited")
+            return addresses
+        except ProviderError:
+            raise
+        except (OSError, ValueError, queue.Empty):
+            raise ProviderError("temporary", "Website DNS lookup failed") from None
+    
+    
+    class _PinnedHTTP(http.client.HTTPConnection):
+        def __init__(self, host, port, address, timeout):
+            super().__init__(host, port=port, timeout=timeout)
+            self.address = address
+            self._deadline_timer = None
+            self._expires = time.monotonic() + timeout
+    
+        def _arm_deadline(self):
+            sock = self.sock
+            def abort():
+                try:
+                    sock.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+            self._deadline_timer = threading.Timer(max(0, self._expires - time.monotonic()), abort)
+            self._deadline_timer.daemon = True
+            self._deadline_timer.start()
+    
+        def connect(self):
+            self.sock = socket.create_connection((self.address, self.port), self.timeout)
+            self._arm_deadline()
+    
+    class _PinnedHTTPS(_PinnedHTTP):
+        def connect(self):
+            # Handshake has a socket timeout; the wall-clock timer then also bounds
+            # slow trickle responses that would otherwise reset per-read timeouts.
+            self.sock = socket.create_connection((self.address, self.port), self.timeout)
+            self.sock.settimeout(max(0.001, self._expires - time.monotonic()))
+            self.sock = ssl.create_default_context().wrap_socket(self.sock, server_hostname=self.host)
+            self._arm_deadline()
+    
+    _UI_NOISE = re.compile(
+        r"(?i)\b("
+        r"skip to content|schedule online|call now|"
+        r"privacy policy|terms of use|cookie policy|"
+        r"all rights reserved|read more"
+        r")\b"
+    )
+    
+    
+    def _clean_visible_text(value: str) -> str:
+        """Normalize visible text and remove private-use icon-font characters."""
+        value = unicodedata.normalize("NFKC", str(value or ""))
+    
+        value = "".join(
+            char
+            for char in value
+            if unicodedata.category(char) not in {"Co", "Cf"}
+        )
+    
+        return re.sub(r"\s+", " ", value).strip()
+    
+    
+    def _usable_evidence_snippet(value: str) -> bool:
+        """Accept concise, readable sentences instead of UI fragments."""
+        value = _clean_visible_text(value)
+    
+        if not 40 <= len(value) <= 260:
+            return False
+    
+        if "|" in value or re.search(r"[◆■□►▶●•]", value):
+            return False
+    
+        if _UI_NOISE.search(value):
+            return False
+    
+        if not re.search(r'[.!?]["\'”’)]?$', value):
+            return False
+    
+        if sum(char.isalpha() for char in value) < 25:
+            return False
+    
+        return True
 
 
 class Research:
@@ -339,82 +383,244 @@ class Research:
         start = _url(website, canonical=False)
         origin = urlsplit(start)
         root_host = urlsplit(normalize_url(start)).netloc
+    
         deadline = time.monotonic() + self.config["timeout_seconds"]
         budget = [self.config["max_bytes"]]
+    
         robots = None
+    
         if self.config["robots_enabled"]:
-            status, _, text = self._fetch(urlunsplit((origin.scheme, origin.netloc, "/robots.txt", "", "")), budget, deadline, root_host)
+            status, _, text = self._fetch(
+                urlunsplit((origin.scheme, origin.netloc, "/robots.txt", "", "")),
+                budget,
+                deadline,
+                root_host,
+            )
+    
             if status in {401, 403}:
-                raise ProviderError("terminal", "Website robots access denied")
+                raise ProviderError(
+                    "terminal",
+                    "Website robots access denied",
+                )
+    
             if status < 400:
                 robots = urllib.robotparser.RobotFileParser()
                 robots.parse(text.splitlines())
-        pages, emails, evidence = [], set(), []
-        queue, seen = [start], set()
-        while queue and len(seen) < self.config["max_pages"]:
-            url = queue.pop(0)
+    
+        pages = []
+        emails = set()
+        evidence = []
+        seen_evidence = set()
+        crawl_queue = [start]
+        seen_pages = set()
+    
+        while crawl_queue and len(seen_pages) < self.config["max_pages"]:
+            url = crawl_queue.pop(0)
             key = normalize_url(url)
-            if key in seen:
+    
+            if key in seen_pages:
                 continue
-            seen.add(key)
+    
+            seen_pages.add(key)
+    
             if robots is not None and not robots.can_fetch(self.USER_AGENT, url):
                 continue
+    
             try:
-                status, final_url, html = self._fetch(url, budget, deadline, root_host, robots)
+                status, final_url, html = self._fetch(
+                    url,
+                    budget,
+                    deadline,
+                    root_host,
+                    robots,
+                )
             except ProviderError as exc:
                 if not pages or exc.kind == "temporary":
                     raise
                 continue
+    
             if status >= 400:
                 continue
+    
             final_key = normalize_url(final_url)
-            seen.add(final_key)
-            # A redirect target must also comply with the same site's robots.
-            if robots is not None and not robots.can_fetch(self.USER_AGENT, final_url):
+            seen_pages.add(final_key)
+    
+            if robots is not None and not robots.can_fetch(
+                self.USER_AGENT, final_url
+            ):
                 continue
-            if any(p["url"] == final_key for p in pages):
+    
+            if any(page["url"] == final_key for page in pages):
                 continue
+    
             soup = BeautifulSoup(html, "html.parser")
-            # Extract public addresses before removing structured data scripts.
+    
+            # Extract public email addresses BEFORE removing HTML elements.
             email_text = soup.get_text(" ", strip=True)
+    
             for tag in soup.select("a[href]"):
                 href = str(tag.get("href", ""))
+    
                 if href.lower().startswith("mailto:"):
                     email_text += " " + href[7:].split("?", 1)[0]
-            for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+    
+            for script in soup.find_all(
+                "script",
+                attrs={"type": "application/ld+json"},
+            ):
                 email_text += " " + script.get_text()
-            for candidate in re.findall(r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", email_text):
+    
+            for candidate in re.findall(
+                r"[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]+"
+                r"@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+                email_text,
+            ):
                 try:
                     address = normalize_email(candidate.strip(".,;"))
-                    if address.split("@", 1)[0] not in {"noreply", "no-reply", "mailer-daemon", "abuse"}:
+    
+                    if address.split("@", 1)[0] not in {
+                        "noreply",
+                        "no-reply",
+                        "mailer-daemon",
+                        "abuse",
+                    }:
                         emails.add(address)
                 except ProviderError:
                     pass
+    
+            # Collect useful same-site links before cleaning the page.
             links = []
+    
             for tag in soup.select("a[href]"):
                 try:
-                    link = _url(urljoin(final_url, str(tag["href"])), canonical=False)
-                    parsed = urlsplit(normalize_url(link))
-                    if parsed.netloc == root_host and normalize_url(link) not in seen:
-                        score = sum(10 for word in ("contact", "about", "team", "service", "company") if word in parsed.path.lower())
+                    link = _url(
+                        urljoin(final_url, str(tag["href"])),
+                        canonical=False,
+                    )
+                    parsed_link = urlsplit(normalize_url(link))
+    
+                    if (
+                        parsed_link.netloc == root_host
+                        and normalize_url(link) not in seen_pages
+                    ):
+                        path = parsed_link.path.lower()
+    
+                        score = sum(
+                            10
+                            for word in (
+                                "contact",
+                                "about",
+                                "team",
+                                "service",
+                                "company",
+                            )
+                            if word in path
+                        )
+    
                         if score:
                             links.append((-score, link))
-                except ProviderError:
+    
+                except (ProviderError, KeyError, ValueError):
                     continue
-            for tag in soup(["script", "style", "noscript", "template", "svg", "nav", "footer"]):
+    
+            # Prefer meaningful page content instead of the global site layout.
+            content = (
+                soup.find("main")
+                or soup.find(attrs={"role": "main"})
+                or soup.find("article")
+                or soup.body
+                or soup
+            )
+    
+            # Remove navigation, decorative controls and non-content elements.
+            for tag in content.select(
+                "nav, footer, header, aside, script, style, noscript, "
+                "template, svg, button, form, input, select, textarea, "
+                '[aria-hidden="true"], [role="navigation"], '
+                '[role="banner"], [role="contentinfo"], '
+                '[class*="breadcrumb"], [id*="breadcrumb"]'
+            ):
                 tag.decompose()
-            text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True)).strip()
-            pages.append({"url": final_key, "text": text})
-            for sentence in re.split(r"(?<=[.!?])\s+", text):
-                # Exact contiguous snippets only, never synthesized facts.
-                snippet = sentence[:500].strip()
-                if len(snippet) >= 20 and len(evidence) < self.config["max_evidence"]:
-                    evidence.append({"id": stable_id(final_key, snippet), "url": final_key, "snippet": snippet})
-            queue.extend(link for _, link in sorted(set(links)))
-            queue = list(dict.fromkeys(queue))[:self.config["max_pages"] * 5]
+    
+            # Build readable blocks from headings and body text.
+            block_texts = []
+    
+            for tag in content.find_all(
+                ["h1", "h2", "h3", "h4", "p", "li", "dd", "dt"]
+            ):
+                block = _clean_visible_text(tag.get_text(" ", strip=True))
+    
+                if block and block not in block_texts:
+                    block_texts.append(block)
+    
+            # Fallback for sites without standard content elements.
+            if not block_texts:
+                fallback = _clean_visible_text(
+                    content.get_text(" ", strip=True)
+                )
+    
+                if fallback:
+                    block_texts.append(fallback)
+    
+            page_text = " ".join(block_texts)
+    
+            pages.append({
+                "url": final_key,
+                "text": page_text,
+            })
+    
+            # Only retain short, complete and readable evidence sentences.
+            for block in block_texts:
+                sentences = re.split(r"(?<=[.!?])\s+", block)
+    
+                for sentence in sentences:
+                    snippet = _clean_visible_text(sentence)
+    
+                    if not _usable_evidence_snippet(snippet):
+                        continue
+    
+                    snippet_key = snippet.casefold()
+    
+                    if snippet_key in seen_evidence:
+                        continue
+    
+                    if len(evidence) >= self.config["max_evidence"]:
+                        break
+    
+                    evidence.append({
+                        "id": stable_id(final_key, snippet),
+                        "url": final_key,
+                        "snippet": snippet,
+                    })
+    
+                    seen_evidence.add(snippet_key)
+    
+                if len(evidence) >= self.config["max_evidence"]:
+                    break
+    
+            crawl_queue.extend(
+                link for _, link in sorted(set(links))
+            )
+            crawl_queue = list(dict.fromkeys(crawl_queue))
+            crawl_queue = crawl_queue[:self.config["max_pages"] * 5]
+    
         if not pages:
-            raise ProviderError("terminal", "No accessible research pages")
-        return {"pages": pages, "evidence": evidence, "emails": sorted(emails)}
+            raise ProviderError(
+                "terminal",
+                "No accessible research pages",
+            )
+    
+        if not evidence:
+            raise ProviderError(
+                "terminal",
+                "No clean, usable website evidence",
+            )
+    
+        return {
+            "pages": pages,
+            "evidence": evidence,
+            "emails": sorted(emails),
+        }
 
 
 SUBJECT = "A question about customer inquiries"
